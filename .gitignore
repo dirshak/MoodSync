@@ -1,0 +1,7 @@
+.venv/
+.env
+emotionground.db
+static/audio/
+__pycache__/
+*.pyc
+.hf_cache/

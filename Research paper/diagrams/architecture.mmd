@@ -1,0 +1,81 @@
+%%{init: {'theme':'neutral', 'flowchart': {'curve': 'basis'}}}%%
+flowchart TD
+    U["User free-text message\n(e.g. \"I can't sit still, everything feels loud today\")"]
+
+    subgraph SYNC["Synchronous within the HTTP request (Stages 1-3)"]
+        direction TB
+
+        subgraph S1["Stage 1 - LLM-Based Emotion Extraction (frozen, prompt-only)"]
+            direction TB
+            P1["Three-tier provider cascade"]
+            A1["1) Hosted low-latency API\n(Llama 3.1-8B variant)"]
+            A2["2) Local Llama 3.1 instance\n(on failure / no config)"]
+            A3["3) Hardcoded neutral fallback\nvalence=0, arousal=0"]
+            P1 --> A1
+            A1 -->|failure, 1 retry| A2
+            A2 -->|unreachable| A3
+            J["Structured JSON output\nvalence in [-1,1], arousal in [-1,1], reply"]
+            A1 --> J
+            A2 --> J
+            A3 --> J
+            V["Validation: strip code fences,\nregex-isolate JSON, coerce floats,\nclamp to [-1,1]"]
+            J --> V
+        end
+
+        subgraph S2["Stage 2 - Valence/Arousal to Descriptor Mapping (deterministic, non-learned)"]
+            direction TB
+            KB[("10 hand-authored emotion regions\nrelaxed, calm, happy, excited, hopeful,\nsad, bored, angry, anxious, exhausted")]
+            NN["k=2 nearest-neighbor lookup\n(Euclidean distance to region coords)"]
+            W["Inverse-distance blend weight\nw1 = (1/d1) / (1/d1 + 1/d2)"]
+            D["Music descriptor:\ntempo range (primary region),\ninstruments/dynamics/mood-words\n(union of both regions)"]
+            KB --> NN
+            NN --> W --> D
+        end
+
+        subgraph S3["Stage 3 - Prompt Construction (templated NLG, non-learned)"]
+            direction TB
+            SAMP["Random sample: 3 mood words,\n3 instruments, 2 dynamics adjectives"]
+            TMPL["Random template selection:\nopener + instrumentation + dynamics + tempo"]
+            PR["Free-text prompt string\nfor MusicGen text encoder"]
+            SAMP --> TMPL --> PR
+        end
+
+        V -->|"(valence, arousal)"| NN
+        D --> SAMP
+    end
+
+    subgraph ASYNC["Dispatched to background daemon thread (Stage 4)"]
+        direction TB
+        subgraph S4["Stage 4 - Text-to-Music Generation (frozen facebook/musicgen-small)"]
+            direction TB
+            ENC["Frozen T5 text encoder\n(text embedding)"]
+            DEC["Decoder-only transformer\n(self-attention, cross-attends to text embedding)"]
+            CODEC["EnCodec neural audio codec\n(4 parallel codebooks, ~50 Hz, delay pattern)"]
+            ENC --> DEC --> CODEC
+            NORM["Peak-normalize to 95% full scale,\nquantize to 16-bit PCM"]
+            CODEC --> NORM
+        end
+    end
+
+    subgraph PERSIST["Stage 5 - Persistence and Playback"]
+        direction TB
+        WAV[("WAV file on filesystem")]
+        DB[("SQLite: message + status\ngenerating -> done / error")]
+        POLL["Frontend polls /status\nevery ~2.5s"]
+        PLAY["Embedded browser audio player"]
+        NORM --> WAV
+        WAV --> DB
+        DB --> POLL --> PLAY
+    end
+
+    U --> V
+    PR -->|"HTTP response returns immediately,\nstatus = generating"| S4
+    POLL -.->|"status = done"| S4
+
+    classDef frozen fill:#e6f0ff,stroke:#3366cc,stroke-width:1.5px;
+    classDef rulebased fill:#fff4e0,stroke:#cc8800,stroke-width:1.5px;
+    classDef store fill:#eeeeee,stroke:#888888,stroke-width:1px;
+
+    class A1,A2,A3,ENC,DEC,CODEC frozen;
+    class KB,NN,W,D,SAMP,TMPL rulebased;
+    class WAV,DB store;

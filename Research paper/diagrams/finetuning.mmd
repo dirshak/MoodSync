@@ -1,0 +1,64 @@
+%%{init: {'theme':'neutral', 'flowchart': {'curve': 'basis'}}}%%
+flowchart TD
+
+    subgraph DATA["Training Data Preparation"]
+        direction TB
+        RAW[("MTG-Jamendo mood/theme subset\n(Creative-Commons, uploader-contributed tags)")]
+        AUDIO["Raw audio clips"]
+        TAGS["Mood/theme tags"]
+        RAW --> AUDIO
+        RAW --> TAGS
+        S2FN["Stage 2 fn: region interpolation\n(same k=2 NN lookup used at inference)"]
+        S3FN["Stage 3 fn: prompt construction\n(same templates used at inference)"]
+        TAGS --> S2FN --> S3FN
+        CAP["Training caption\n(matches inference-time prompt distribution)"]
+        S3FN --> CAP
+        CODECFRZ["Frozen EnCodec tokenizer"]
+        AUDIO --> CODECFRZ
+        TOK["Target discrete audio tokens\n(4 codebooks, ~50 Hz)"]
+        CODECFRZ --> TOK
+    end
+
+    subgraph MODEL["facebook/musicgen-small (~300M params)"]
+        direction TB
+        TENC["Text encoder (T5-based)\nFROZEN - no gradient updates"]
+        DECB["Decoder transformer backbone\n(feed-forward, embeddings, norms)\nFROZEN - no gradient updates"]
+        ATTN["Attention projection layers\n(q_proj / v_proj in each block)\nBASE WEIGHTS FROZEN"]
+        LORA["LoRA adapter matrices A, B\nrank r=16, alpha=32\ninjected via HuggingFace peft\nTRAINABLE (only updated params)"]
+        TENC --> DECB --> ATTN
+        ATTN -.->|"low-rank update\nW' = W_frozen + (alpha/r) * B*A"| LORA
+    end
+
+    subgraph TRAIN["Training Loop"]
+        direction TB
+        FWD["Forward pass:\ncaption -> text embed -> decoder + LoRA delta\n-> predicted token logits"]
+        LOSS["Cross-entropy loss vs.\ntarget audio tokens"]
+        BWD["Backward pass:\ngradients flow ONLY into LoRA A, B\n(base weights receive no gradient)"]
+        HP["Hyperparameters:\nbatch size 4, lr 1e-4, 10 epochs"]
+        FWD --> LOSS --> BWD
+        HP -.-> FWD
+    end
+
+    subgraph OUT["Output and Evaluation"]
+        direction TB
+        CKPT[("Fine-tuned checkpoint =\nfrozen base + trained LoRA adapter")]
+        EVAL["Five-metric evaluation:\nFAD, CLAP, MOS, KL divergence,\nchroma cosine similarity"]
+        CKPT --> EVAL
+    end
+
+    CAP --> FWD
+    TOK --> LOSS
+    LORA --> FWD
+    BWD -->|"updates"| LORA
+    LORA --> CKPT
+    ATTN --> CKPT
+    TENC --> CKPT
+    DECB --> CKPT
+
+    classDef frozen fill:#e6f0ff,stroke:#3366cc,stroke-width:1.5px;
+    classDef trainable fill:#e8f8e8,stroke:#2e8b2e,stroke-width:2px;
+    classDef data fill:#fff4e0,stroke:#cc8800,stroke-width:1.5px;
+
+    class TENC,DECB,ATTN,CODECFRZ frozen;
+    class LORA,BWD trainable;
+    class RAW,AUDIO,TAGS,S2FN,S3FN,CAP,TOK data;

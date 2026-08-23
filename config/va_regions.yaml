@@ -1,0 +1,93 @@
+# Named regions in valence/arousal space (both axes in [-1, 1]).
+# va_mapper.py finds the nearest region(s) to an extracted (valence, arousal)
+# pair and interpolates between the two closest to build a music descriptor.
+regions:
+  - name: relaxed
+    valence: 0.4
+    arousal: -0.5
+    descriptor:
+      tempo: "60-80 bpm"
+      instruments: [acoustic guitar, soft piano, light strings, warm pads]
+      dynamics: [soft, sustained, unhurried]
+      mood_words: [warm, unhurried, gentle, easy]
+
+  - name: calm
+    valence: 0.2
+    arousal: -0.8
+    descriptor:
+      tempo: "50-65 bpm"
+      instruments: [ambient pads, soft piano, gentle synths, felt piano]
+      dynamics: [minimal, spacious, floating]
+      mood_words: [peaceful, still, serene, quiet]
+
+  - name: happy
+    valence: 0.8
+    arousal: 0.5
+    descriptor:
+      tempo: "110-130 bpm"
+      instruments: [bright synths, claps, marimba, ukulele]
+      dynamics: [energetic, bouncy, buoyant]
+      mood_words: [bright, playful, uplifting, sunny]
+
+  - name: excited
+    valence: 0.7
+    arousal: 0.9
+    descriptor:
+      tempo: "128-150 bpm"
+      instruments: [driving synths, punchy drums, brass stabs, electric guitar]
+      dynamics: [propulsive, building, big]
+      mood_words: [euphoric, electric, triumphant, soaring]
+
+  - name: hopeful
+    valence: 0.5
+    arousal: 0.1
+    descriptor:
+      tempo: "85-105 bpm"
+      instruments: [piano, warm strings, soft electric guitar, light percussion]
+      dynamics: [building, tender, open]
+      mood_words: [hopeful, tender, optimistic, gentle]
+
+  - name: sad
+    valence: -0.7
+    arousal: -0.3
+    descriptor:
+      tempo: "55-70 bpm"
+      instruments: [solo piano, sparse strings, low cello]
+      dynamics: [minor key, sparse, slow]
+      mood_words: [melancholic, reflective, wistful, tender]
+
+  - name: bored
+    valence: -0.3
+    arousal: -0.7
+    descriptor:
+      tempo: "60-75 bpm"
+      instruments: [muted piano, soft ambient drone, distant pads]
+      dynamics: [flat, static, understated]
+      mood_words: [muted, listless, gray, subdued]
+
+  - name: angry
+    valence: -0.7
+    arousal: 0.8
+    descriptor:
+      tempo: "130-150 bpm"
+      instruments: [distorted synth bass, driving percussion, heavy drums]
+      dynamics: [intense, rhythmic, hard-hitting]
+      mood_words: [aggressive, tense, forceful, raw]
+
+  - name: anxious
+    valence: -0.5
+    arousal: 0.7
+    descriptor:
+      tempo: "120-140 bpm, irregular"
+      instruments: [atmospheric pads, dissonant textures, nervous strings]
+      dynamics: [tense, fast, uneasy]
+      mood_words: [unsettled, atmospheric, restless, jittery]
+
+  - name: exhausted
+    valence: -0.4
+    arousal: -0.9
+    descriptor:
+      tempo: "45-60 bpm"
+      instruments: [slow piano, deep drone, faint strings]
+      dynamics: [heavy, weighted, sparse]
+      mood_words: [weary, heavy, drained, hollow]

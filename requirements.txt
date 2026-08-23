@@ -1,0 +1,20 @@
+# CPU-only PyTorch wheels (no NVIDIA GPU assumed). If you have a CUDA GPU and want
+# GPU acceleration, remove the line below and install torch per https://pytorch.org/get-started/locally/
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+flask>=3.0
+python-dotenv>=1.0
+pyyaml>=6.0
+
+# LLM providers for emotion extraction + reply (Groq primary, Ollama local fallback)
+groq>=0.11
+requests>=2.31
+
+# Music generation: Hugging Face transformers' MusicGen (facebook/musicgen-small),
+# not the fragile facebookresearch/audiocraft package (which hard-pins torch==2.1.0
+# and does not install on Python 3.12).
+torch>=2.2
+transformers>=4.40
+accelerate>=0.30
+scipy>=1.11
+sentencepiece>=0.2

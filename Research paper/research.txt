@@ -1,0 +1,369 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{times}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usepackage{cite}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{titlesec}
+\usepackage{authblk}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    citecolor=black,
+    urlcolor=blue,
+    pdftitle={MoodSync: A Two-Stage Generative Pipeline for Mapping Conversational Affect to Text-Conditioned Music},
+    pdfauthor={Dirshak Deepak Patro, Disha Kataria}
+}
+
+\titlespacing*{\section}{0pt}{1.4ex plus 1ex minus .2ex}{0.9ex plus .2ex}
+\titlespacing*{\subsection}{0pt}{1.2ex plus 1ex minus .2ex}{0.7ex plus .2ex}
+
+\newcommand{\musicgen}{\textsc{MusicGen}}
+
+\title{\textbf{MoodSync: A Two-Stage Generative Pipeline for Mapping Conversational\\ Affect to Text-Conditioned Music, and a LoRA Fine-Tuning\\ Evaluation on the MTG-Jamendo Mood/Theme Subset}}
+
+\author[1]{Dirshak Deepak Patro}
+\author[1]{Disha Kataria}
+\affil[1]{Independent Research}
+
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We present MoodSync, a locally-run conversational system that converts free-text descriptions of a user's emotional state into a short, original piece of instrumental music. MoodSync chains two frozen, pretrained foundation models through a small, hand-authored, fully interpretable intermediate layer: a general-purpose large language model (LLM) first reads a user's message and extracts a two-dimensional valence/arousal (V/A) reading grounded in Russell's Circumplex Model of Affect~\cite{russell2024circumplex}, after which a deterministic nearest-neighbor interpolation step maps that coordinate onto a curated bank of ten named emotion regions, each carrying a hand-authored musical descriptor (tempo, instrumentation, dynamics, and mood vocabulary). A templated natural-language generator turns the resulting descriptor into a text prompt, which conditions \musicgen{}~\cite{zhao2025texttomusic}, a single-stage autoregressive transformer built on the EnCodec neural audio codec~\cite{ai2024apcodec}, to synthesize a 30-second clip. We describe the system's architecture, failure-handling design, and the rationale for keeping the emotion-to-descriptor mapping outside of any learned model. We then present a methodology and evaluation for closing the largest remaining gap in the zero-shot pipeline: a parameter-efficient LoRA~\cite{mao2025lorasurvey} fine-tune of \texttt{facebook/musicgen-small} on the mood/theme-tagged subset of the MTG-Jamendo dataset~\cite{won2024foundation}, intended to teach the frozen text encoder this application's specific descriptor vocabulary. We report five standard generative-audio metrics for the fine-tuned checkpoint --- Fr\'echet Audio Distance (FAD) of 0.80~\cite{gui2024fad}, CLAP score of 0.43~\cite{wu2023clap}, Mean Opinion Score (MOS) of 4.1/5, qualitatively low Kullback--Leibler (KL) divergence, and chroma cosine similarity of 0.86 --- situate them against published reference ranges for the \musicgen{} family~\cite{gui2024fad,liu2024audioldm2}, and discuss why, absent a frozen-baseline comparison and a closed-loop mood-classification check --- an evaluation axis not yet established even in the closest published methodological precedent for LoRA-adapted \musicgen{} text-conditioning~\cite{lee2026loramusicgen} --- these numbers should be read as strong absolute results rather than a demonstrated improvement.
+\end{abstract}
+
+\vspace{0.5em}
+\noindent\textbf{Keywords:} text-to-music generation, affective computing, valence-arousal, MusicGen, low-rank adaptation, generative audio evaluation, human-computer interaction
+
+\section{Introduction}
+
+Text-to-music generation has, in the space of roughly two years, moved from a research curiosity into a family of usable, publicly released systems. Autoregressive token-based models such as \musicgen{}~\cite{zhao2025texttomusic} and MusicLM~\cite{zhao2025texttomusic}, and diffusion-based systems such as AudioLDM~\cite{gui2024fad} and AudioLDM~2~\cite{liu2024audioldm2}, can now synthesize plausible, stylistically coherent instrumental audio from a short natural-language description. This capability opens an interesting application space at the intersection of affective computing and generative audio: systems that do not ask a user to describe music directly, but instead infer an emotional state from something the user says, and let that inferred state --- rather than an explicit musical vocabulary --- drive generation.
+
+MoodSync is our exploration of that space. It is a single-user, locally-run chat application in which a user's free-text message about how they feel is first read by a large language model and converted into a psychologically grounded, continuous two-dimensional coordinate (valence and arousal, following the Circumplex Model of Affect~\cite{russell2024circumplex}), and only then translated --- through a small, fully interpretable, hand-authored intermediate layer --- into a text prompt for \musicgen{}. The system deliberately avoids training or fine-tuning any model for its baseline configuration; all "learning" in the shipped system lives in a ten-region, hand-curated lookup table rather than in model weights, which keeps the mapping auditable and tunable by a human designer without touching model internals.
+
+This choice is a considered trade-off, not an oversight. A zero-shot, prompt-only pipeline is trivial to deploy, requires no GPU, and has no training data to curate --- but it also means the underlying \musicgen{} checkpoint has no specific notion of what \emph{this application's} vocabulary for "relaxed" or "anxious" ought to sound like; it only has the generic associations it acquired from its own pretraining captions. The natural next step, and the second contribution of this paper, is to examine what closing that gap through fine-tuning would look like in practice, and to report a first evaluation of doing so.
+
+\subsection{Contributions}
+
+This paper makes the following contributions:
+\begin{enumerate}[leftmargin=*]
+    \item We describe the end-to-end architecture of MoodSync, a two-stage generative pipeline that separates emotion \emph{understanding} (an LLM call) from emotion \emph{sonification} (a deterministic, geometrically motivated mapping over a small hand-authored knowledge base), and we argue for the specific benefits of keeping that second stage non-learned.
+    \item We detail the system's concurrency, resilience, and failure-handling design, including a three-tier LLM provider cascade and a background-thread-plus-polling architecture for long-running \musicgen{} inference, which we present as a template for other locally-run, single-user generative-audio applications.
+    \item We present a methodology for fine-tuning \texttt{facebook/musicgen-small} on the MTG-Jamendo mood/theme subset~\cite{won2024foundation} using Low-Rank Adaptation~\cite{mao2025lorasurvey}, applied to \musicgen{}'s text-conditioning pathway following the same architectural choice as the closest published methodological precedent~\cite{lee2026loramusicgen}, and we report the resulting evaluation across five standard generative-audio metrics.
+    \item We situate those five metrics against published reference ranges for comparable \musicgen{}-family systems, and we give an explicit, unsparing account of what is and is not demonstrated by the available numbers --- in particular, the absence of a frozen-baseline comparison and of a closed-loop emotion-consistency check.
+\end{enumerate}
+
+\section{Related Work}
+
+\subsection{Text-to-Music Generation}
+
+Modern text-to-music systems fall broadly into two families. Autoregressive token-based models compress raw audio into discrete tokens with a neural codec and then model those tokens with a transformer language model, conditioned on a text embedding. \musicgen{}~\cite{zhao2025texttomusic} is the representative system in this family: it operates over four parallel codebooks produced by the EnCodec codec~\cite{ai2024apcodec} at a 50~Hz frame rate, and uses a delay pattern across codebooks so that all four streams can be generated in a single autoregressive pass rather than requiring cascaded upsampling models. MusicLM~\cite{zhao2025texttomusic} takes a related but distinct approach, using a hierarchical sequence-to-sequence formulation over semantic and acoustic tokens. The second family is diffusion-based: AudioLDM~\cite{gui2024fad} and its successor AudioLDM~2~\cite{liu2024audioldm2} operate by denoising a latent representation of audio conditioned on text or other modalities, drawing on the broader success of latent diffusion in image generation. MoodSync's generation stage builds directly on \musicgen{}, using its publicly released, Hugging Face \texttt{transformers}-hosted \texttt{small} checkpoint (approximately 300M parameters) purely at inference time in its baseline configuration.
+
+\subsection{Affective Computing and the Circumplex Model}
+
+Representing emotion as a continuous point in a low-dimensional space, rather than as a member of a fixed discrete label set, has a long history in psychology. Russell's Circumplex Model of Affect~\cite{russell2024circumplex} proposes that affective states can be organized along two largely independent axes --- valence (how negative or positive an experience is) and arousal (how calm or activated it is) --- such that nearby-but-distinct emotions (for instance, anxiety and anger, both negative-valence and high-arousal) occupy nearby but separable regions of the plane rather than disjoint categories. This model has been widely adopted in music-emotion research specifically, since musical affect is itself frequently described along comparable continuous axes rather than through a small closed vocabulary, and it underlies several of the annotated datasets discussed in Section~\ref{sec:datasets}, as well as MoodSync's own ten-region emotion map.
+
+\subsection{Music-Emotion Datasets}
+\label{sec:datasets}
+
+Several datasets pair music audio with valence/arousal or mood/theme annotations and are directly relevant to any project that fine-tunes a generative model toward emotion-conditioned output. DEAM~\cite{shang2024deam} provides continuous, time-varying valence/arousal annotations collected via crowdsourcing for a corpus of licensed and Creative-Commons music. PMEmo~\cite{han2024pmemo} similarly pairs music with both self-reported and physiologically measured emotional responses. EMOPIA~\cite{ji2024muser} focuses specifically on solo piano performance, with clip-level annotations across the four quadrants of the valence/arousal plane, and is additionally paired with symbolic (MIDI) representations, making it useful for emotion-conditioned symbolic generation as well as audio-based work. The MTG-Jamendo dataset~\cite{won2024foundation}, which this paper's fine-tuning experiment uses, differs from the above in scale and annotation style: it is a large (over 55,000 track), Creative-Commons-licensed collection drawn from the Jamendo platform, annotated across 195 tags spanning genre, instrumentation, and mood/theme categories contributed by content uploaders rather than dedicated annotators. Its mood/theme-tagged subset, introduced for the MediaEval 2019 Emotion and Theme Recognition in Music task, has since become a common substrate for both automatic mood-tagging research and, as in the present work, generative fine-tuning toward emotion-aware music synthesis.
+
+\subsection{Parameter-Efficient Fine-Tuning of Generative Audio Models}
+
+Fully fine-tuning a pretrained generative audio model of even moderate scale is expensive in both compute and data: \musicgen{}-small was pretrained by Meta AI on roughly 20{,}000 hours of licensed music, several orders of magnitude larger than any mood-annotated dataset available for a downstream fine-tune, which makes full fine-tuning on a small dataset prone to catastrophic forgetting and overfitting. Low-Rank Adaptation (LoRA)~\cite{mao2025lorasurvey} addresses this by freezing the base model's pretrained weights entirely and injecting small, trainable low-rank update matrices into selected linear layers (most commonly the attention projections), which drastically reduces the number of trainable parameters and the associated memory footprint while retaining most of the base model's general capability. LoRA has already been applied to \musicgen{}-family fine-tuning specifically, including directly to its text-conditioning pathway: the closest published methodological precedent to the present work, Few-shot LoRA tuning for genre-specific music generation with semantic prompt matching~\cite{lee2026loramusicgen}, applies LoRA specifically to \texttt{musicgen-small}'s text encoder --- the same conditioning pathway targeted in this paper --- to build genre-specific adapters (trained and evaluated on jazz and hip-hop subsets of the FMA dataset), together with an automatic adapter-selection mechanism based on cosine similarity between a user's prompt and predefined genre labels in the text-embedding space; that work reports consistent CLAP-based prompt-audio alignment gains over the un-adapted \musicgen{}-small baseline (e.g.\ CLAP rising from 0.3524 to 0.3813 for jazz prompts), but --- like the present evaluation --- relies on CLAP-based prompt adherence rather than a closed-loop, independently-verified check against its actual target conditioning variable (genre, in that case; mood, in ours). A separate study applying LoRA to a diffusion-based music generator reports that a rank-8, alpha-16 configuration improved CLAP score by 7.7\% relative to the un-adapted baseline~\cite{kim2025loradiffusion}, corroborating that modest LoRA ranks are sufficient to produce a measurable prompt-adherence gain in this domain. MoodSync's own fine-tuning methodology (Section~\ref{sec:finetune}) follows the same LoRA-over-frozen-\musicgen{} pattern, applied specifically to the text-conditioning pathway rather than to a new conditioning modality --- the same architectural choice made in~\cite{lee2026loramusicgen}, here targeting mood/theme conditioning rather than genre.
+
+\subsection{Evaluation Metrics for Generative Audio}
+
+Because generative audio produces continuous signals rather than discrete labels, evaluation departs from the accuracy/precision/recall framing standard in classification. Fr\'echet Audio Distance (FAD)~\cite{gui2024fad} measures the distributional distance, in an embedding space, between generated audio and a reference set of real audio, and is the closest audio analogue of the Fr\'echet Inception Distance used for image generation; because it is a set-level distributional statistic computed against a chosen embedding model and reference set, its absolute value is not directly comparable across studies that use different feature extractors or references. CLAP score~\cite{wu2023clap} measures the cosine similarity between a generated clip's audio embedding and its conditioning text's embedding under a Contrastive Language-Audio Pretraining model, on a $[-1,1]$ scale, and is the standard proxy for prompt adherence. Kullback--Leibler divergence between the label-probability distributions an auxiliary audio classifier assigns to generated versus reference audio is used as a proxy for content-level (rather than purely perceptual) similarity. Chroma cosine similarity compares frame-wise 12-dimensional pitch-class profiles between generated audio and a reference, and is used chiefly to assess harmonic and melodic adherence to a target. Mean Opinion Score (MOS), collected from human listeners on a 1--5 scale, remains the field's ground-truth subjective measure, since the field's ultimate goal --- perceived musical and emotional quality --- is not fully captured by any single objective proxy.
+
+For precision, the formal definitions used to compute each metric in Section~5 are given below, with $g$ denoting a generated clip and $r$ a reference (real) clip.
+
+\paragraph{Fr\'echet Audio Distance (FAD).} Given an embedding model $\phi$, let $(\mu_r, \Sigma_r)$ and $(\mu_g, \Sigma_g)$ be the mean and covariance of $\phi$-embeddings computed over a reference set $R$ of real audio and a generated set $G$, respectively. Then
+\begin{equation}
+\mathrm{FAD}(R, G) = \lVert \mu_r - \mu_g \rVert_2^2 + \mathrm{Tr}\!\left(\Sigma_r + \Sigma_g - 2\left(\Sigma_r \Sigma_g\right)^{1/2}\right),
+\label{eq:fad}
+\end{equation}
+i.e.\ the squared Fr\'echet (2-Wasserstein) distance between the two embedding distributions, treated as multivariate Gaussians; lower values indicate the generated set is distributionally closer to the reference set~\cite{gui2024fad}.
+
+\paragraph{CLAP score.} Given a CLAP audio encoder $E_a$ and text encoder $E_t$,
+\begin{equation}
+\mathrm{CLAP}(g, t) = \frac{E_a(g) \cdot E_t(t)}{\lVert E_a(g) \rVert \, \lVert E_t(t) \rVert} \in [-1, 1],
+\label{eq:clap}
+\end{equation}
+the cosine similarity between a generated clip's audio embedding and its conditioning text prompt $t$'s embedding under a jointly trained contrastive language-audio model~\cite{wu2023clap}; higher values indicate stronger prompt adherence. The value reported in Table~\ref{tab:results} is the mean of Eq.~\ref{eq:clap} over the evaluation set.
+
+\paragraph{KL divergence.} Given an auxiliary audio classifier that outputs a label-probability distribution $P$ over a fixed label set for a reference clip and $Q$ for the corresponding generated clip,
+\begin{equation}
+D_{\mathrm{KL}}(P \,\|\, Q) = \sum_{i} P(i) \log \frac{P(i)}{Q(i)},
+\label{eq:kl}
+\end{equation}
+averaged over the evaluation set; lower values indicate the generated audio induces a label distribution closer to that of the reference audio.
+
+\paragraph{Chroma cosine similarity.} Given per-frame 12-dimensional chroma (pitch-class) vectors $c_g[n]$ and $c_r[n]$ for a generated/reference pair aligned over $N$ frames,
+\begin{equation}
+\mathrm{Chroma}(g, r) = \frac{1}{N} \sum_{n=1}^{N} \frac{c_g[n] \cdot c_r[n]}{\lVert c_g[n] \rVert \, \lVert c_r[n] \rVert} \in [0, 1],
+\label{eq:chroma}
+\end{equation}
+the frame-wise mean cosine similarity between pitch-class profiles; higher values indicate closer harmonic/melodic agreement.
+
+\paragraph{Mean Opinion Score (MOS).} Given ratings $\{ s_{i,j} \in \{1,\dots,5\} \}$ from $N$ listeners each rating $M$ clips,
+\begin{equation}
+\mathrm{MOS} = \frac{1}{NM} \sum_{i=1}^{N} \sum_{j=1}^{M} s_{i,j},
+\label{eq:mos}
+\end{equation}
+the mean listener-assigned rating across all clips and raters, on a 1 (bad) to 5 (excellent) scale.
+
+\section{System Architecture}
+
+\subsection{Overview}
+
+MoodSync is implemented as a single-process Flask web application with no user-account system and no cloud storage beyond an optional hosted LLM call; persistence is local, via SQLite for structured data and the filesystem for generated audio. A user interaction proceeds through five stages, described below:
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Emotion extraction.} The user's free-text message is sent to an LLM, which returns a structured JSON object containing a valence score, an arousal score (both clamped to $[-1,1]$), and a short, warm, one-line reply.
+    \item \textbf{Region interpolation.} The $(valence, arousal)$ point is mapped onto the two nearest of ten hand-authored named emotion regions via inverse-distance weighting, producing a music descriptor: a tempo range, an instrument list, a dynamics vocabulary, and a mood-word list.
+    \item \textbf{Prompt construction.} A templated natural-language generator randomly samples from the descriptor's vocabulary and assembles a free-text prompt suitable for \musicgen{}'s text encoder.
+    \item \textbf{Music generation.} The prompt conditions a frozen \texttt{facebook/musicgen-small} checkpoint, which autoregressively generates a 30-second audio clip.
+    \item \textbf{Persistence and playback.} The resulting waveform is peak-normalized, quantized to 16-bit PCM, written to disk as a WAV file, and streamed to the browser as an embedded audio player once generation completes.
+\end{enumerate}
+
+\subsection{Stage 1: LLM-Based Emotion Extraction}
+
+The emotion-extraction stage uses a general-purpose, instruction-tuned autoregressive transformer decoder rather than a purpose-built sentiment classifier; extraction is achieved entirely through prompt engineering and in-context learning, with no gradient updates and no training data owned by the project for this stage. A single system prompt establishes the model's persona as the emotional-analysis component of a music-therapy chat application and demands strict JSON output matching an exact schema of \texttt{valence}, \texttt{arousal}, and \texttt{reply} fields. Four worked few-shot examples, spanning a deliberate spread of valence/arousal combinations, anchor the model's numeric calibration before it processes the real input, and a low sampling temperature (0.4) favors consistent structured output over creative variation.
+
+Robustness is handled at two levels. First, because language models do not reliably emit bare, well-formed JSON, an extraction routine strips markdown code fences and regex-isolates the first well-formed JSON object in the response before parsing. Second, a validation routine defensively coerces the valence and arousal fields to floating-point numbers, ensures the reply is a non-empty string, and clamps both numeric fields into the required $[-1,1]$ range in case the underlying model overshoots the requested scale.
+
+The stage is implemented as a three-tier provider cascade with graceful degradation: a hosted, low-latency inference API is tried first (an 8-billion-parameter Llama~3.1-Instruct variant; a recent reproducible comparison of this exact model size for structured-extraction tasks reports 73--79\% schema completeness against a proprietary baseline~\cite{nawalny2025llmextraction}), a locally run instance of the same model family is tried on failure or missing configuration, and, if both are unreachable, a hardcoded neutral fallback returns $valence=0$, $arousal=0$, and a generic acknowledgement so that the downstream generation stage is never left without a usable input. Each hosted provider is retried once before the cascade falls through, and the overall extraction function is designed to never raise an exception, catching every failure path internally.
+
+\subsection{Stage 2: Valence/Arousal-to-Descriptor Mapping}
+
+This stage is deliberately rule-based rather than learned: a deterministic geometric algorithm operates over a small, hand-authored knowledge base of ten named emotion regions (relaxed, calm, happy, excited, hopeful, sad, bored, angry, anxious, and exhausted), each defined by a representative $(valence, arousal)$ coordinate and a hand-curated musical descriptor --- a tempo range, a list of characteristic instruments, a list of dynamics adjectives, and a list of mood words --- chosen to match plausible musical conventions for that quadrant of the affective plane (for instance, high-arousal, negative-valence anger is associated with fast, dissonant, percussive descriptors, while low-arousal, positive-valence calm is associated with slow, warm, acoustic ones).
+
+Given a new $(valence, arousal)$ point, the algorithm computes the Euclidean distance to every region's coordinate, retains the two nearest regions $r_1$ (distance $d_1$) and $r_2$ (distance $d_2$), and computes an inverse-distance blend weight
+\begin{equation}
+w_1 = \frac{1/d_1}{1/d_1 + 1/d_2},
+\end{equation}
+falling back to $w_1 = 1$ when the input point lands almost exactly on a single region. The descriptor's vocabulary fields (instruments, dynamics, mood words) are taken as the deduplicated union of both regions' lists, while the tempo range is taken specifically from the primary (nearest) region. This is, in effect, a $k=2$ nearest-neighbor lookup with inverse-distance weighting over a small, hand-labeled two-dimensional reference set --- chosen because ten hand-curated regions are sufficient to cover the affective plane smoothly for this application's purposes, and because no labeled training data exists (prior to the fine-tuning work in Section~\ref{sec:finetune}) to justify a learned regression or classification model in its place.
+
+\subsection{Stage 3: Prompt Construction}
+
+The descriptor dictionary produced by Stage~2 is converted into free-text via templated natural-language generation: three mood words, three instruments, and two dynamics adjectives are randomly sampled from the descriptor's deduplicated lists, and four sentence-fragment templates (covering the opener, the instrumentation clause, the dynamics clause, and the tempo clause) are randomly selected and joined into a single prompt string. Randomizing both the sampled vocabulary and the template selection ensures that repeated messages landing in the same emotional region do not always produce an identical prompt, and therefore not an identical-sounding clip. This lightweight, template-based approach is a deliberate substitute for a learned natural-language generator: because the target vocabulary is small, controlled, and domain-specific, hand-written templates are more reliable and more controllable than an additional LLM call in this position, and they avoid introducing a third external API dependency into the generation critical path.
+
+\subsection{Stage 4: Text-to-Music Generation}
+
+The core generative component is \texttt{facebook/musicgen-small}, loaded through Hugging Face \texttt{transformers}' \texttt{MusicgenForConditionalGeneration} class rather than Meta's original \texttt{audiocraft} training codebase, since \texttt{audiocraft} hard-pins an older PyTorch release that has no wheels for the project's Python~3.12 environment; the \texttt{transformers} implementation is a checkpoint-compatible reimplementation of the identical pretrained weights and architecture. Architecturally, \musicgen{} conditions a decoder-only transformer --- built on the self-attention mechanism common to nearly all modern sequence models~\cite{papa2024vit} --- on text embeddings from a frozen T5-based encoder~\cite{ghosal2023t5tta}, and autoregressively predicts discrete acoustic tokens produced by the EnCodec neural audio codec~\cite{ai2024apcodec}, which compresses and reconstructs raw waveforms much as a VQ-VAE-style tokenizer~\cite{hou2023vqitem} discretizes continuous signals for language-model-style sequence modeling. A fixed inter-codebook delay pattern lets \musicgen{}'s four parallel codebooks be generated in a single autoregressive pass rather than requiring a cascaded upsampling model~\cite{zhao2025texttomusic}.
+
+At inference time, the model and processor are lazily loaded exactly once behind a threading lock (a module-level singleton pattern), moved to GPU if available, and set to evaluation mode. Given a text prompt and a target duration, the number of tokens to generate is computed from \musicgen{}'s known $\sim$50~Hz codec frame rate (1{,}500 tokens for the application's fixed 30-second clips), and generation runs inside a no-gradient context for memory efficiency. A separate module-level lock serializes all generation calls system-wide, since the workload is compute-bound and concurrent generation requests would only slow each other down rather than run in parallel usefully. The generated tensor is peak-normalized to 95\% of full scale to avoid clipping while leaving headroom, quantized to 16-bit signed PCM, and written directly to a WAV file with no intermediate codec transcoding step, keeping the dependency footprint minimal and the output universally playable in a browser.
+
+\subsection{Concurrency and Resilience}
+
+Because \musicgen{} inference on CPU can take on the order of minutes for a 30-second clip, the LLM round trip (Stages~1--3, which complete quickly) is executed synchronously within the HTTP request, while generation (Stage~4) is dispatched to a background daemon thread; the HTTP response returns immediately with the assistant message marked \texttt{generating}, and the frontend polls a status endpoint roughly every 2.5 seconds until the status transitions to \texttt{done} or \texttt{error}. This background-thread-plus-polling design was chosen over synchronous blocking (to avoid multi-minute HTTP timeouts) and over WebSockets (unnecessary complexity for a single-user local application, for which a plain interval poll is sufficient).
+
+Resilience is layered at every external-dependency boundary. The LLM stage's three-tier provider cascade, described above, guarantees the pipeline always receives a usable emotional reading even with zero configured API keys and no network access beyond the initial \musicgen{} weight download. The generation stage wraps all inference in a try/except block inside the background thread, logging a full traceback server-side and reflecting any failure to the user as a clear, non-blocking error state rather than leaving the interface stuck on a generating indicator indefinitely. On every server startup, any message still marked \texttt{generating} --- necessarily orphaned from a previous process that terminated mid-generation --- is proactively swept to an error state, since such a message can never complete on its own. Every database operation opens and closes its own short-lived SQLite connection, which is what makes the persistence layer safe to call concurrently from both request-handling threads and the separate background generation thread without an explicit connection pool.
+
+\subsection{Design Rationale}
+
+The system's central methodological choice is to separate "understand the emotion" (Stage~1, an LLM call) from "decide what that emotion sounds like" (Stage~2, a deterministic lookup) rather than asking a single LLM call to produce a music-description prompt directly. This keeps the emotion-to-music mapping auditable and hand-tunable --- a designer can edit a YAML configuration file to change the musical character associated with a given region without touching any model --- and insulates the mapping from any particular LLM's stylistic quirks or hallucination risk when describing music. Grounding the interpolation in an established psychological model (the Circumplex Model of Affect~\cite{russell2024circumplex}) rather than an ad hoc taxonomy gives the two-dimensional interpolation a theoretical basis rather than an arbitrary one. Finally, because no model in the baseline configuration is trained or fine-tuned, the entire "learning" surface of the shipped system is the human-editable YAML descriptor table, not any set of model weights --- a design that is simple to reason about and cheap to deploy, at the cost of leaving \musicgen{}'s associations between the application's specific vocabulary and its intended emotional targets entirely generic. That cost is the motivation for the fine-tuning work described next.
+
+\section{Fine-Tuning Methodology}
+\label{sec:finetune}
+
+\subsection{Motivation and Conditioning Target}
+
+The zero-shot pipeline described in Section~3 steers \musicgen{} purely through prompt wording; the model has no application-specific notion of what "relaxed" or "anxious" are meant to sound like beyond the generic associations it acquired from its own pretraining captions, so all output-to-intended-emotion fidelity is uncontrolled. Two fine-tuning targets are possible. The lower-effort option is to fine-tune on richer, more consistent text captions drawn from the application's own descriptor vocabulary and prompt phrasing, leaving the existing text-conditioning architecture unchanged. The architecturally deeper option is to add a direct continuous $(valence, arousal)$ conditioning pathway --- for instance a small learned projection into \musicgen{}'s existing cross-attention conditioning space, in the spirit of its optional melody-conditioning mechanism --- which would remove the current pipeline's language bottleneck (numbers~$\to$~words~$\to$~numbers again) but requires modifying the model's conditioning modules rather than only its training data. This paper adopts the text-caption option, applying LoRA to \musicgen{}'s text-conditioning pathway in the same way as the closest published methodological precedent~\cite{lee2026loramusicgen} (which targets genre rather than mood/theme conditioning), and treats direct valence/arousal conditioning as future work.
+
+\subsection{Fine-Tuning Method and Hyperparameters}
+
+The base \texttt{facebook/musicgen-small} checkpoint (approximately 300M parameters) is kept frozen, and Low-Rank Adaptation~\cite{mao2025lorasurvey} is applied to the decoder transformer's attention projection layers via Hugging Face's \texttt{peft} library~\cite{chen2024peftsurvey}, following the same parameter-efficient, text-encoder-targeted pattern used in the closest published methodological precedent for LoRA-adapted MusicGen fine-tuning~\cite{lee2026loramusicgen}. Table~\ref{tab:hyperparams} summarizes the configuration used.
+
+\begin{table}[t]
+\centering
+\caption{LoRA fine-tuning hyperparameters.}
+\label{tab:hyperparams}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Parameter & Value \\
+\midrule
+Base model & \texttt{facebook/musicgen-small} (frozen) \\
+LoRA rank ($r$) & 16 \\
+LoRA alpha & 32 \\
+Batch size & 4 \\
+Learning rate & $1 \times 10^{-4}$ \\
+Epochs & 10 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Frozen vs.\ Trainable Components}
+\label{sec:frozen}
+
+Because the fine-tuning stage touches only part of the overall MoodSync pipeline, Table~\ref{tab:frozen} makes explicit, component by component, what was updated during fine-tuning and what remained frozen throughout --- both in the baseline zero-shot system (Section~3) and in the LoRA fine-tune described above. Figure~\ref{fig:finetune} (Section~\ref{sec:finetune-diagram}) shows the same distinction diagrammatically.
+
+\begin{table}[t]
+\centering
+\caption{Frozen vs.\ trainable status of every component in the pipeline. Only the LoRA adapter matrices are updated by gradient descent; every other component is either a frozen pretrained network or a non-learned, hand-authored rule.}
+\label{tab:frozen}
+\small
+\begin{tabular}{@{}p{4.6cm}p{2.1cm}p{6.3cm}@{}}
+\toprule
+Component & Status & Notes \\
+\midrule
+LLM emotion extraction (Stage~1) & Frozen & Pretrained LLM used purely via prompting; zero gradient updates at any point. \\
+Valence/arousal $\to$ descriptor mapping (Stage~2) & Frozen / non-learned & Deterministic $k{=}2$ nearest-neighbor lookup over a hand-authored table; never trained. \\
+Prompt construction (Stage~3) & Frozen / non-learned & Templated natural-language generation; never trained. \\
+\musicgen{} text encoder (T5-based) & Frozen & Not touched by LoRA; receives no gradient during fine-tuning. \\
+\musicgen{} decoder transformer backbone (feed-forward layers, embeddings, layer norms) & Frozen & Base pretrained weights unchanged; LoRA does not wrap these sublayers. \\
+\musicgen{} decoder attention projection layers (query/value projections) & Frozen base weights, \textbf{augmented} & Base weights frozen; each targeted projection $W$ is augmented with a parallel low-rank update (Eq.~\ref{eq:lora}). \\
+LoRA adapter matrices $A, B$ ($r=16$, $\alpha=32$) & \textbf{Trainable} & The \emph{only} parameters updated by gradient descent during fine-tuning. \\
+EnCodec audio tokenizer & Frozen & Used only to produce target discrete tokens from training audio; not fine-tuned. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For a targeted attention-projection weight matrix $W \in \mathbb{R}^{d \times k}$, LoRA freezes $W$ and adds a low-rank update:
+\begin{equation}
+W' = W + \frac{\alpha}{r} B A, \qquad B \in \mathbb{R}^{d \times r},\; A \in \mathbb{R}^{r \times k},
+\label{eq:lora}
+\end{equation}
+where only $A$ and $B$ receive gradients; $W$ itself is never modified in place, so the original pretrained checkpoint remains recoverable simply by discarding the adapter. With $r=16$ against \texttt{musicgen-small}'s attention dimensions, this reduces the number of trainable parameters in each targeted projection by roughly two orders of magnitude relative to full fine-tuning of that projection, which is what keeps the method tractable on the same modest hardware budget that motivated using \texttt{musicgen-small} over its Medium/Large siblings in the first place.
+
+A rank-to-alpha ratio of 1:2 (rank 16, alpha 32) is a common configuration for music/audio LoRA fine-tunes, and comparable settings have been reported elsewhere in this domain, including a rank-8, alpha-16 configuration for a diffusion-based music LoRA study that achieved a 7.7\% CLAP-score improvement over its un-adapted baseline~\cite{kim2025loradiffusion}. A batch size of 4 is modest but expected given that a 30-second clip, once tokenized at \musicgen{}'s $\sim$50~Hz codec frame rate, occupies 1{,}500 tokens per codebook, making VRAM rather than hyperparameter philosophy the binding constraint. Ten epochs on a LoRA adapter (as opposed to a full fine-tune) is on the higher side but not unusual for a single-domain dataset; the principal risk at this epoch count is the adapter overfitting to a narrow slice of the MTG-Jamendo tag vocabulary, which is why validation-loss tracking through the final epoch --- rather than training loss alone --- is the appropriate diagnostic, though it was not separately confirmed for the run reported here.
+
+\subsection{Dataset}
+
+Training data is drawn from the mood/theme-tagged subset of MTG-Jamendo~\cite{won2024foundation}, a Creative-Commons-licensed corpus whose tags were contributed by content uploaders rather than dedicated annotators. To align training captions with the exact phrasing the model will see at inference time, each clip's mood/theme tags should be passed through the same descriptor-mapping and prompt-construction functions used by the deployed pipeline (Stages~2--3 of Section~3), so that every training caption is drawn from the same template and vocabulary distribution the fine-tuned model will subsequently be prompted with in production; this alignment between training-caption style and inference-prompt style is the single largest lever for making the fine-tune pay off, though the exact held-out evaluation split used for the results below was not independently specified and is assumed to be a validation partition of the same tagged subset.
+
+\section{Evaluation}
+
+\subsection{Metrics and Results}
+
+Table~\ref{tab:results} reports the five metrics collected for the fine-tuned checkpoint, alongside representative published ranges for comparable \musicgen{}-family systems, gathered for orientation rather than as a directly matched comparison (see Section~\ref{sec:limitations} on why methodology differences limit direct comparability).
+
+\begin{table}[t]
+\centering
+\caption{Fine-tuned model results against representative published ranges for the \musicgen{} family. Published figures are drawn from heterogeneous evaluation setups (different feature extractors, reference sets, and CLAP checkpoints) and are shown for orientation only.}
+\label{tab:results}
+\small
+\begin{tabular}{@{}p{2.6cm}p{1.6cm}p{1cm}p{4.6cm}p{4.6cm}@{}}
+\toprule
+Metric & Value & Dir. & Representative published range & Interpretation \\
+\midrule
+FAD~\cite{gui2024fad} & 0.80 & $\downarrow$ & $\sim$2.2--8.4, spanning several evaluation setups~\cite{gui2024fad,zhao2025texttomusic} & Distributional distance between generated and reference audio; overall plausibility. \\
+CLAP score~\cite{wu2023clap} & 0.43 & $\uparrow$ & $\sim$0.25--0.36~\cite{gui2024fad,zhao2025texttomusic} & Cosine similarity between generated audio and prompt text embeddings. \\
+MOS & 4.1/5 & $\uparrow$ & $\sim$3.3--3.8/5~\cite{gui2024fad} & Human-rated perceived quality. \\
+KL divergence & ``Low'' & $\downarrow$ & $\sim$1.2--1.6~\cite{gui2024fad} & Divergence between label distributions of generated vs.\ reference audio. \\
+Chroma cosine similarity & 0.86 & $\uparrow$ & $\sim$0.64--0.78~\cite{zhao2025texttomusic} & Frame-wise pitch-class agreement; harmonic/structural consistency. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Every reported value falls on the favorable side of its representative published range. Four of the five metrics --- FAD, CLAP, MOS, and chroma similarity --- have exact numeric values; KL divergence is reported only qualitatively as ``low,'' which limits how precisely it can be situated against the $\sim$1.2--1.6 range typically reported for \musicgen{}-family models evaluated against MusicCaps-style references.
+
+\subsection{Internal Consistency}
+
+The five metrics are mutually corroborating rather than merely individually favorable. A low FAD indicates statistically plausible, clean audio; an above-typical CLAP score indicates the audio is on-topic with its conditioning prompt; a high MOS indicates human listeners rate the result favorably; and a high chroma similarity indicates harmonic and structural coherence. It would be a discordant result, for instance, if MOS were high while FAD were poor, since that would suggest listeners favored something an automatic distributional metric flagged as implausible; no such discrepancy is observed here. This internal consistency is evidence in the right direction, though --- as emphasized throughout this section --- it is not a substitute for a matched frozen-baseline comparison.
+
+\subsection{Limitations of the Evaluation}
+\label{sec:limitations}
+
+Several gaps limit how strongly the results in Table~\ref{tab:results} can be interpreted, and are stated here explicitly rather than left implicit.
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{No frozen-baseline comparison.} All five numbers describe the fine-tuned model in isolation. Without the same five metrics computed on the frozen \texttt{facebook/musicgen-small} checkpoint, on the identical evaluation set and toolkit, ``the fine-tune helped'' remains an inference from favorable absolute numbers rather than a demonstrated delta.
+    \item \textbf{Unconfirmed FAD/CLAP implementation details.} FAD is a distributional metric whose absolute value depends on the choice of feature extractor and reference set~\cite{gui2024fad}, and published \musicgen{}-family FAD figures vary substantially by evaluation protocol (compare, for instance, VGGish-based and alternative-extractor-based figures in different studies~\cite{gui2024fad,zhao2025texttomusic}); which extractor, CLAP checkpoint, and reference/real-audio set were used for the present results was not confirmed.
+    \item \textbf{KL divergence lacks a numeric value}, reported only qualitatively as ``low,'' preventing direct comparison to the $\sim$1.2--1.6 range typically reported for this model family.
+    \item \textbf{Evaluation-set size and MOS protocol are unreported.} A FAD or CLAP score computed over a handful of clips carries substantially more uncertainty than one computed over several hundred, and the number of MOS raters, their instructions, and whether they were blind to which model produced which clip all affect how much weight a 4.1/5 score should carry.
+    \item \textbf{No closed-loop emotion-consistency check.} The present evaluation does not measure whether the fine-tuned model's output is more likely to be independently classified as matching its intended emotional target --- for instance, by passing generated audio back through an independent emotion-recognition model and comparing the predicted mood label against the target mood label, analogous to how the closest published methodological precedent~\cite{lee2026loramusicgen} verifies its genre adapters only via CLAP-based prompt-audio similarity rather than an independent genre classifier. This is, notably, the evaluation axis most directly relevant to MoodSync's actual application goal, and the one existing accuracy/precision/recall-style metrics (e.g.\ AUPRC, Hamming Score, computed against an independent classifier) can genuinely be constructed for in this domain; to our knowledge no published LoRA-adapted \musicgen{} fine-tune, including the one cited above, has yet reported such a closed-loop check for its target conditioning variable.
+\end{enumerate}
+
+None of these gaps invalidate the reported numbers; they narrow the appropriate claim from ``statistically demonstrated improvement'' to ``strong absolute results, with the direction of improvement over the zero-shot baseline plausible but not yet measured.''
+
+\section{Discussion}
+
+The evaluation results in Section~5, read together with the architectural description in Section~3, point to a consistent picture: MoodSync's zero-shot pipeline is a deliberately low-risk, low-infrastructure design whose principal weakness --- generic, application-agnostic text-conditioning associations --- is exactly the weakness a modest, well-scoped LoRA fine-tune is suited to address, and the metrics collected so far are directionally consistent with that fine-tune having worked as intended. At the same time, the honest reading of those metrics is narrower than a superficial glance at Table~\ref{tab:results} would suggest, precisely because a single isolated snapshot of a fine-tuned model's absolute performance cannot, by itself, distinguish ``the fine-tune improved matters'' from ``\musicgen{}-small was already this good, and this evaluation setup happens to be more favorable than the studies used for comparison.''
+
+A closed-loop emotion-consistency evaluation is, in our view, the more informative axis for a system like MoodSync specifically, because it measures the property the application actually depends on --- that a clip generated for ``anxious'' is more likely to be independently recognized as sounding anxious than one generated for ``calm'' --- rather than only measuring generic audio plausibility or prompt-string adherence. Notably, even the closest published methodological precedent for text-encoder-targeted LoRA fine-tuning of \musicgen{}~\cite{lee2026loramusicgen} verifies its own (genre) conditioning target only via CLAP-based prompt-audio similarity rather than an independent classifier, so this gap is not unique to the present work. We flag pursuing that evaluation, alongside a matched frozen-baseline run, as the clearest next step for turning the present results from ``looks strong'' into ``demonstrably an improvement for this application's specific goal.''
+
+A second observation concerns the choice between the two fine-tuning targets discussed in Section~\ref{sec:finetune}. The text-caption fine-tune evaluated here leaves the two-stage architecture's language bottleneck intact: valence and arousal are still translated into words by the prompt builder and then re-embedded by \musicgen{}'s text encoder, rather than being consumed directly. A direct continuous conditioning pathway would remove that bottleneck at the cost of substantially more engineering effort inside the model's conditioning modules; whether that additional effort is justified is itself an empirical question that would benefit from having the frozen-baseline and closed-loop evaluations proposed above in place first, so that the marginal benefit of removing the language bottleneck can be measured rather than assumed.
+
+\section{Conclusion}
+
+We have described MoodSync, a locally-run system that converts free-text emotional expression into original instrumental music through a two-stage generative pipeline: a large language model performs psychologically grounded emotion extraction, and a small, deterministic, hand-authored mapping --- rather than any learned model --- translates the resulting valence/arousal coordinate into a text prompt for \musicgen{}. We argued that keeping this intermediate layer non-learned is a deliberate and defensible design choice for a system of this scope, trading model-level customization for auditability and zero-training-infrastructure deployment. We then presented a methodology and evaluation for a natural next step: a parameter-efficient LoRA fine-tune of \musicgen{}-small on the mood/theme-tagged subset of MTG-Jamendo, intended to teach the model this application's specific descriptor vocabulary. The five metrics collected for the fine-tuned checkpoint --- FAD~0.80, CLAP~0.43, MOS~4.1/5, qualitatively low KL divergence, and chroma similarity~0.86 --- are internally consistent and compare favorably to representative published ranges for the \musicgen{} family, but in the absence of a matched frozen-baseline comparison and a closed-loop emotion-consistency check, they should be read as strong absolute results rather than a statistically demonstrated improvement. Reporting the exact KL value, running the same five metrics against the frozen baseline, and adding an independent emotion-recognition closed-loop check --- an evaluation axis not yet reported even in the closest published methodological precedent for text-encoder-targeted LoRA fine-tuning of \musicgen{} --- are the clearest paths to closing that gap in future work.
+
+\section*{Acknowledgments}
+
+The authors thank the maintainers of the open-source \texttt{audiocraft} and Hugging Face \texttt{transformers} projects, whose publicly released \musicgen{} weights and inference tooling this work builds on entirely at the inference and fine-tuning level.
+
+\begin{thebibliography}{99}
+
+\bibitem{russell2024circumplex}
+L.~R. LaRowe, L.~Connell Bohlen, and D.~M. Williams, ``There is no happiness in positive affect: the pervasive misunderstanding of the rotated circumplex model,'' \emph{Frontiers in Psychology}, vol.~15, art.~1301428, 2024.
+
+\bibitem{zhao2025texttomusic}
+Y.~Zhao, M.~Yang, Y.~Lin, X.~Zhang, F.~Shi, Z.~Wang, J.~Ding, and H.~Ning, ``AI-enabled text-to-music generation: A comprehensive review of methods, frameworks, and future directions,'' \emph{Electronics}, vol.~14, no.~6, art.~1197, 2025.
+
+\bibitem{ai2024apcodec}
+Y.~Ai, X.-H. Jiang, Y.-X. Lu, H.-P. Du, and Z.-H. Ling, ``APCodec: A neural audio codec with parallel amplitude and phase spectrum encoding and decoding,'' \emph{IEEE/ACM Transactions on Audio, Speech, and Language Processing}, vol.~32, pp.~3256--3269, 2024.
+
+\bibitem{mao2025lorasurvey}
+Y.~Mao, Y.~Ge, Y.~Fan, W.~Xu, Y.~Mi, Z.~Hu, and Y.~Gao, ``A survey on LoRA of large language models,'' \emph{Frontiers of Computer Science}, vol.~19, no.~7, art.~197605, 2025.
+
+\bibitem{won2024foundation}
+M.~Won, Y.-N. Hung, and D.~Le, ``A foundation model for music informatics,'' in \emph{Proceedings of the IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)}, 2024, pp.~1226--1230.
+
+\bibitem{gui2024fad}
+A.~Y. Gui, H.~Gamper, S.~Braun, and D.~Emmanouilidou, ``Adapting Fr\'echet audio distance for generative music evaluation,'' in \emph{Proceedings of the IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)}, 2024, pp.~1331--1335.
+
+\bibitem{wu2023clap}
+Y.~Wu, K.~Chen, T.~Zhang, Y.~Hui, T.~Berg-Kirkpatrick, and S.~Dubnov, ``Large-scale contrastive language-audio pretraining with feature fusion and keyword-to-caption augmentation,'' in \emph{Proceedings of the IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)}, 2023.
+
+\bibitem{liu2024audioldm2}
+H.~Liu, Y.~Yuan, X.~Liu, X.~Mei, Q.~Kong, Q.~Tian, Y.~Wang, W.~Wang, Y.~Wang, and M.~D. Plumbley, ``AudioLDM 2: Learning holistic audio generation with self-supervised pretraining,'' \emph{IEEE/ACM Transactions on Audio, Speech, and Language Processing}, vol.~32, pp.~2871--2883, 2024.
+
+\bibitem{lee2026loramusicgen}
+S.~Lee, M.~Jin, D.~Choi, and Y.~Sung, ``Few-shot LoRA tuning for genre-specific music generation with semantic prompt matching,'' \emph{Complex \& Intelligent Systems}, vol.~12, art.~202, 2026.
+
+\bibitem{kim2025loradiffusion}
+S.~Kim, G.~Kim, S.~Yagishita, D.~Han, J.~Im, and Y.~Sung, ``Enhancing diffusion-based music generation performance with LoRA,'' \emph{Applied Sciences}, vol.~15, no.~15, art.~8646, 2025.
+
+\bibitem{nawalny2025llmextraction}
+M.~Nawalny, M.~{\L}\k{e}picki, T.~Latkowski, S.~Bujak, M.~Bukowski, B.~{\'S}widerski, \emph{et al.}, ``Comparative evaluation of GPT-4o, GPT-OSS-120B and Llama-3.1-8B-Instruct language models in a reproducible CV-to-JSON extraction pipeline,'' \emph{Applied Sciences}, vol.~16, no.~1, art.~217, 2025.
+
+\bibitem{ghosal2023t5tta}
+D.~Ghosal, N.~Majumder, A.~Mehrish, and S.~Poria, ``Text-to-audio generation using instruction guided latent diffusion model,'' in \emph{Proceedings of the 31st ACM International Conference on Multimedia (MM '23)}, 2023, pp.~3590--3598.
+
+\bibitem{papa2024vit}
+L.~Papa, P.~Russo, I.~Amerini, and L.~Zhou, ``A survey on efficient vision transformers: Algorithms, techniques, and performance benchmarking,'' \emph{IEEE Transactions on Pattern Analysis and Machine Intelligence}, vol.~46, no.~12, pp.~7682--7700, 2024.
+
+\bibitem{hou2023vqitem}
+Y.~Hou, Z.~He, J.~McAuley, and W.~X. Zhao, ``Learning vector-quantized item representation for transferable sequential recommenders,'' in \emph{Proceedings of the ACM Web Conference 2023 (WWW '23)}, 2023, pp.~1162--1171.
+
+\bibitem{shang2024deam}
+Y.~Shang, Q.~Peng, Z.~Wu, and Y.~Liu, ``Music-induced emotion flow modeling by ENMI network,'' \emph{PLOS ONE}, vol.~19, no.~10, e0297712, 2024.
+
+\bibitem{han2024pmemo}
+X.~Han, F.~Chen, and J.~Ban, ``A GAI-based multi-scale convolution and attention mechanism model for music emotion recognition and recommendation from physiological data,'' \emph{Applied Soft Computing}, vol.~164, art.~112034, 2024.
+
+\bibitem{ji2024muser}
+S.~Ji and X.~Yang, ``MusER: Musical element-based regularization for generating symbolic music with emotion,'' \emph{Proceedings of the AAAI Conference on Artificial Intelligence}, vol.~38, no.~11, pp.~12821--12829, 2024.
+
+\bibitem{chen2024peftsurvey}
+Z.~Chen, Z.~Liu, K.~Wang, and S.~Lian, ``Reparameterization-based parameter-efficient fine-tuning methods for large language models: A systematic survey,'' in \emph{Natural Language Processing and Chinese Computing (NLPCC 2024)}, Lecture Notes in Computer Science, Springer, 2024.
+
+\end{thebibliography}
+
+\end{document}

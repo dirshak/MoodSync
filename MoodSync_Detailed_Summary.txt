@@ -1,0 +1,933 @@
+================================================================================
+MOODSYNC — DETAILED TECHNICAL SUMMARY
+A Local Chat Application that Converts Expressed Mood into Generated Music
+================================================================================
+Prepared: 2026-08-23
+
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+MoodSync is a locally-run, single-user chat web application built with Flask
+(Python). A user types a free-text message describing how they feel. The
+system:
+
+  1. Sends the text to a Large Language Model (LLM), which extracts a
+     psychological "valence/arousal" (V/A) emotion reading and drafts a
+     short, warm, one-line reply.
+  2. Maps that (valence, arousal) point onto a curated 2-D "emotion map" of
+     10 named regions (relaxed, calm, happy, excited, hopeful, sad, bored,
+     angry, anxious, exhausted), interpolating between the two nearest
+     regions to build a "music descriptor" (tempo, instruments, dynamics,
+     mood words).
+  3. Turns that descriptor into a natural-language text prompt.
+  4. Feeds the prompt into MusicGen (Meta AI's text-to-music generative
+     model, `facebook/musicgen-small`) to synthesize a 30-second original
+     instrumental audio clip.
+  5. Persists the chat, the LLM reply, the V/A values, and the resulting
+     .wav file, and streams the finished clip back into the chat UI as an
+     embedded audio player.
+
+The result is a two-stage, chained generative-AI pipeline: a text-generation
+model (LLM) turns unstructured emotional language into structured
+psychological coordinates and a short reply, and an audio-generation model
+(MusicGen) turns those coordinates (via a rule-based descriptor layer) into
+music. No user account system, no cloud storage — everything is local
+(SQLite + filesystem), aside from the optional hosted LLM call.
+
+
+================================================================================
+2. HIGH-LEVEL ARCHITECTURE / DATA FLOW
+================================================================================
+
+    user message (free text)
+        |
+        v
+    [1] LLM call (Groq hosted API -> Ollama local fallback -> neutral fallback)
+        produces: { valence: float[-1,1], arousal: float[-1,1], reply: str }
+        |
+        v
+    [2] Nearest-2-region interpolation over config/va_regions.yaml
+        produces: music descriptor { tempo, instruments[], dynamics[], mood_words[] }
+        |
+        v
+    [3] prompt_builder.py: descriptor -> randomized natural-language MusicGen prompt
+        |
+        v
+    [4] MusicGen (facebook/musicgen-small, frozen pretrained weights)
+        produces: raw audio tensor -> 30s WAV file
+        |
+        v
+    [5] Persisted to static/audio/<chat_id>/<message_id>.wav
+        path stored in SQLite; message status flips generating -> done
+
+Two concurrency-relevant properties:
+  - Steps [1]-[2]-[3] are fast (LLM round trip only) and are executed
+    synchronously within the HTTP request, so the assistant's text reply
+    and V/A values return to the browser immediately.
+  - Step [4] (MusicGen inference) is comparatively slow, especially on CPU
+    (can take a couple of minutes for a 30s clip), so it is dispatched to a
+    background daemon thread. The Flask response for the message-send
+    request does not wait on it; instead the assistant message is created
+    with status = "generating" and the frontend polls
+    GET /api/messages/<id> every ~2.5 seconds until the status flips to
+    "done" (audio ready) or "error" (generation failed).
+
+
+================================================================================
+3. TECHNOLOGY STACK
+================================================================================
+
+  Backend framework   : Flask >= 3.0 (Python), single-process, threaded=True
+  Persistence         : SQLite (emotionground.db), stdlib sqlite3, one
+                         short-lived connection per operation (safe across
+                         Flask request threads + the background generation
+                         thread)
+  LLM providers       : Groq hosted inference API (primary) — model
+                         llama-3.1-8b-instant by default
+                         Ollama local server (fallback) — model llama3.1
+                         by default, via localhost:11434
+  Text-to-music model : Hugging Face `transformers`
+                         MusicgenForConditionalGeneration, weights
+                         `facebook/musicgen-small` (~1.5GB, auto-downloaded
+                         and cached in ~/.cache/huggingface on first use)
+  Audio math/IO       : PyTorch (inference), NumPy (normalization),
+                         SciPy `scipy.io.wavfile` (raw WAV writing — no
+                         ffmpeg / codec dependency at all)
+  Config              : YAML (config/va_regions.yaml) via PyYAML
+  Frontend            : Vanilla HTML/CSS/JS (templates/index.html,
+                         static/js/app.js, static/css/style.css) — no
+                         framework, no build step. Polling-based, not
+                         WebSocket-based.
+  Env/config mgmt     : python-dotenv, .env file (GROQ_API_KEY,
+                         GROQ_MODEL, OLLAMA_BASE_URL, OLLAMA_MODEL, HF_HOME)
+
+
+================================================================================
+4. THE GENERATIVE AI COMPONENTS IN DETAIL
+================================================================================
+
+--------------------------------------------------------------------------
+4.1  STAGE 1 — LLM-BASED EMOTION EXTRACTION + REPLY GENERATION
+--------------------------------------------------------------------------
+
+File: llm_client.py
+
+Purpose: convert unstructured natural language ("I've had a terrible day,
+I'm exhausted") into a structured, machine-usable emotional reading plus a
+short empathetic reply — in a single LLM call.
+
+Model type: This stage uses a general-purpose autoregressive Large Language
+Model (an instruction-tuned transformer decoder), NOT a specialized
+sentiment-classification model. Emotion extraction is achieved purely
+through prompt engineering / in-context learning against an off-the-shelf
+chat LLM — there is no fine-tuning, no gradient updates, no training data
+owned by this project for this stage.
+
+Providers, tried in order (a "provider cascade" / graceful-degradation
+pattern):
+  1. Groq — a hosted, extremely low-latency LLM inference API. Default
+     model: llama-3.1-8b-instant (an 8-billion-parameter Llama 3.1 variant,
+     served by Groq's custom LPU inference hardware for fast responses).
+     Requires GROQ_API_KEY.
+  2. Ollama — a local LLM runtime. Default model: llama3.1 (same model
+     family, run entirely on the user's own machine via a local HTTP API at
+     http://localhost:11434). Used automatically if Groq is unconfigured or
+     the call throws/times out.
+  3. Neutral hardcoded fallback — if both providers are unreachable, the
+     function returns valence=0.0, arousal=0.0 and a generic acknowledgement
+     string, so the downstream pipeline (music generation) never has
+     nothing to work with. get_emotion_and_reply() is explicitly designed
+     to "never raise" — every exception path is caught internally.
+
+Prompting technique — structured JSON output via a system prompt:
+  - A single SYSTEM_PROMPT establishes the LLM's persona ("the
+    emotional-analysis component of a music-therapy chat app") and demands
+    STRICT JSON output with an exact schema:
+        {"valence": <float -1..1>, "arousal": <float -1..1>, "reply": "<...>"}
+  - This is a classic zero/few-shot prompting strategy: the prompt includes
+    four worked examples (few-shot exemplars) covering a spread of
+    valence/arousal combinations (e.g., very negative/low-energy "exhausted"
+    example; very positive/high-energy "got the job" example; neutral
+    example; negative/high-energy "flight cancelled" example) to anchor the
+    LLM's calibration of the numeric scale before it sees the real input.
+  - Temperature is set low (0.4) to favor consistent, low-variance
+    structured output over creative variation.
+  - max_tokens is capped at 200 since the expected output is small JSON.
+
+Robustness / output parsing layer (since LLMs are not guaranteed to emit
+valid JSON, and can wrap output in markdown fences or add commentary):
+  - _extract_json(): strips leading/trailing ``` / ```json code fences,
+    then regex-searches for the first {...} block and attempts
+    json.loads() on it.
+  - _validate(): defensively coerces valence/arousal to float, reply to a
+    non-empty string; clamps valence and arousal into the required [-1, 1]
+    range with max(-1.0, min(1.0, x)) in case the LLM overshoots.
+  - Each provider gets up to 2 attempts (a simple retry loop) before being
+    considered failed and falling through to the next provider in the
+    cascade.
+
+Conceptual model — the Circumplex Model of Affect: The two extracted
+scalars, valence (how negative <-> positive an emotion is) and arousal
+(how calm/low-energy <-> activated/high-energy an emotion is), are the two
+axes of Russell's Circumplex Model of Affect, a well-established
+psychological model that represents emotions as points in a continuous 2-D
+plane rather than as a fixed discrete label set. This is the theoretical
+justification for asking the LLM to output two floats instead of a
+single classification label — it lets nearby-but-distinct emotions (e.g.
+"anxious" vs. "angry", both negative-valence/high-arousal) be represented
+and interpolated between, rather than forced into disjoint buckets.
+
+
+--------------------------------------------------------------------------
+4.2  STAGE 2 — VALENCE/AROUSAL -> MUSIC DESCRIPTOR MAPPING (RULE-BASED, NOT LEARNED)
+--------------------------------------------------------------------------
+
+File: music/va_mapper.py + config/va_regions.yaml
+
+This stage is deliberately NOT a machine-learning model — it is a
+deterministic geometric algorithm plus a hand-authored knowledge base
+(config/va_regions.yaml), acting as the "glue"/grounding layer between the
+LLM's raw output and the generative audio model's expected input format
+(natural language). This keeps the mapping fully interpretable and
+designer-controllable rather than opaque.
+
+Knowledge base (config/va_regions.yaml): 10 hand-authored named emotion
+"regions", each defined as:
+  - A representative (valence, arousal) coordinate, e.g.
+      relaxed  = ( 0.4, -0.5)      excited = (0.7, 0.9)
+      calm     = ( 0.2, -0.8)      hopeful = (0.5, 0.1)
+      happy    = ( 0.8,  0.5)      sad     = (-0.7,-0.3)
+      bored    = (-0.3, -0.7)      angry   = (-0.7, 0.8)
+      anxious  = (-0.5, 0.7)       exhausted = (-0.4,-0.9)
+  - A music descriptor: tempo range (e.g. "128-150 bpm"), a list of
+    characteristic instruments (e.g. "distorted synth bass, driving
+    percussion, heavy drums" for angry), a list of dynamics adjectives
+    (e.g. "intense, rhythmic, hard-hitting"), and a list of mood words
+    (e.g. "aggressive, tense, forceful, raw"). These were curated by hand
+    to match plausible real-world musical conventions for each emotional
+    quadrant of the circumplex (e.g. high arousal + negative valence =
+    fast, dissonant, percussive; low arousal + positive valence = slow,
+    warm, acoustic).
+
+Algorithm — nearest-2-region weighted interpolation:
+  1. nearest_regions(valence, arousal, n=2): compute Euclidean distance
+     (math.hypot, i.e. sqrt((v1-v2)^2 + (a1-a2)^2)) from the LLM's V/A
+     point to every region's coordinate; sort ascending; keep the 2
+     closest regions (r1 at distance d1, r2 at distance d2).
+  2. map_va_to_descriptor():
+       - If d1 is ~0 (point lands almost exactly on a region), use that
+         region alone with full weight (w1 = 1.0).
+       - Otherwise compute an inverse-distance blend weight:
+             w1 = (1/d1) / (1/d1 + 1/d2)
+         (Note: this is a soft interpolation weight for reporting/blend
+         transparency; the actual descriptor fields — tempo, instruments,
+         dynamics, mood_words — are taken as the union of the primary
+         region's list plus the secondary region's list, de-duplicated
+         via dict.fromkeys(), so both regions' vocabulary is available to
+         the prompt builder even though tempo is taken specifically from
+         the primary/nearest region only.)
+  3. Output: a descriptor dict {primary_region, secondary_region,
+     blend_weight, tempo, instruments[], dynamics[], mood_words[]}.
+
+This is conceptually a k-nearest-neighbors (k=2) lookup with
+inverse-distance weighting over a small, hand-labeled 2-D reference set —
+a lightweight, explainable, non-learned mapping chosen specifically
+because 10 hand-curated regions are enough to cover the emotional plane
+smoothly and because it avoids needing a trained regression/classification
+model for a problem with no available labeled training data.
+
+
+--------------------------------------------------------------------------
+4.3  STAGE 3 — PROMPT CONSTRUCTION (TEMPLATE-BASED NLG)
+--------------------------------------------------------------------------
+
+File: music/prompt_builder.py
+
+Purpose: convert the structured descriptor dict into the free-text natural
+language prompt that MusicGen's text encoder expects (MusicGen, like most
+text-to-audio diffusion/transformer models, is conditioned on a text
+description of the desired music, not on discrete tags).
+
+Method — templated natural language generation with randomized sampling:
+  - Randomly samples 3 mood words, 3 instruments, and 2 dynamics
+    adjectives from the descriptor's (deduplicated, blended) lists via
+    random.sample(), so that repeated messages landing in the same
+    emotional region do not always generate an identical prompt string
+    (and therefore not an identical-sounding clip).
+  - Assembles four sentence fragments from small template pools (4 opener
+    templates, 3 instrument-clause templates, 3 dynamics-clause
+    templates, 1 tempo-clause template), each randomly chosen via
+    random.choice(), then joins them into one prompt string, e.g.:
+      "A bright, playful instrumental track. Featuring bright synths,
+       claps, ukulele. Energetic dynamics throughout. Tempo around
+       110-130 bpm."
+  - This randomized template composition is a lightweight stand-in for a
+    learned NLG model — chosen because the vocabulary space is small,
+    controlled, and domain-specific (music descriptors), so hand-written
+    templates are more reliable/controllable than an LLM call here, and
+    avoid a third external API dependency in the critical generation path.
+
+
+--------------------------------------------------------------------------
+4.4  STAGE 4 — TEXT-TO-MUSIC GENERATION (THE CORE GENERATIVE MODEL)
+--------------------------------------------------------------------------
+
+File: music/generator.py
+
+Model: facebook/musicgen-small — Meta AI's MusicGen, loaded via Hugging
+Face `transformers`' MusicgenForConditionalGeneration class (an
+HF-maintained, drop-in-equivalent reimplementation of the original
+facebookresearch/audiocraft MusicGen weights and architecture; the README
+documents that audiocraft itself was not usable on this project's Python
+3.12 environment because it hard-pins torch==2.1.0, which lacks
+Python-3.12 wheels — so this app substitutes the officially-maintained HF
+`transformers` wrapper around the identical pretrained weights, with
+equivalent output quality/behavior).
+
+Architecture (MusicGen, background): MusicGen is a single-stage
+auto-regressive Transformer language model that generates music
+conditioned on a text description (and optionally a melody). Internally:
+  1. A frozen text encoder (T5-based, via the "flan-t5" text encoder
+     paired with musicgen-small) embeds the input text prompt into a
+     sequence of hidden states used as cross-attention conditioning.
+  2. An EnCodec neural audio codec compresses raw waveforms into discrete
+     acoustic tokens across multiple parallel codebooks (this is how
+     continuous audio becomes a sequence a transformer can model, similar
+     to how VQ-VAE-style tokenizers work for images).
+  3. A decoder-only Transformer autoregressively predicts the discrete
+     EnCodec tokens (music generation is cast as a sequence-to-sequence /
+     "language modeling" problem over these audio tokens rather than over
+     text), conditioned on the text embeddings from step (1). MusicGen
+     uses a "delay pattern" across its 4 codebooks so tokens across
+     codebooks can be generated in parallel with a fixed inter-codebook
+     offset, which is what makes single-stage generation practical without
+     a separate cascaded upsampling model.
+  4. The generated token sequence is decoded back into a raw waveform by
+     EnCodec's decoder.
+  musicgen-small has ~300M parameters and was pretrained by Meta on a
+  large licensed/internal corpus of music (this app does NOT retrain or
+  fine-tune it — see Section 5, "no training data" note).
+
+How this app uses it — inference only, frozen weights, zero-shot text
+conditioning (no fine-tuning, no training):
+  - _ensure_loaded(): lazy-loads the model + AutoProcessor exactly once
+    (module-level singleton pattern, guarded by a threading.Lock to avoid
+    duplicate loads under concurrent requests), moves it to CUDA if a GPU
+    is available, else CPU (torch.cuda.is_available() check), and sets
+    model.eval() (disables dropout / puts the model in inference mode).
+  - generate_music(prompt, duration_seconds, out_path):
+      - The AutoProcessor tokenizes/encodes the text prompt
+        (processor(text=[prompt], padding=True, return_tensors="pt")).
+      - max_new_tokens is computed from the desired clip duration using
+        the model's known token frame rate: musicgen-small's audio codec
+        runs at ~50 Hz, so max_new_tokens = duration_seconds * 50 (for the
+        app's fixed 30-second clips, that's 1500 tokens).
+      - model.generate(**inputs, max_new_tokens=...) runs the actual
+        autoregressive sampling loop inside torch.no_grad() (no gradient
+        tracking needed for pure inference — saves memory/compute).
+      - A module-level threading.Lock (_generate_lock) serializes
+        generation calls — only one clip renders at a time system-wide,
+        by design, because this workload is CPU/GPU-bound and running two
+        generations concurrently would just make both slower rather than
+        speeding either up (explicitly documented in the code comment).
+  - Output post-processing: the generated audio tensor is moved to
+    float32/CPU/NumPy, peak-normalized (audio / max(abs(audio)) * 0.95, to
+    prevent clipping while leaving slight headroom), then quantized to
+    16-bit signed PCM (audio * 32767 -> int16) and written directly as a
+    .wav file via scipy.io.wavfile.write() — no ffmpeg/codec transcoding
+    step is used anywhere, keeping the dependency footprint small and
+    the output a universally browser-playable raw WAV.
+
+
+================================================================================
+5. "DATASET" — WHAT DATA THIS APP ACTUALLY USES
+================================================================================
+
+Important nuance for a GenAI-theory analysis: this application does not
+train any model itself, and therefore has no traditional training
+dataset of its own. It composes two pretrained, frozen, third-party
+generative models via prompting/inference, glued together by a small
+hand-authored configuration file. The "datasets" relevant to this project
+are:
+
+  1. Underlying pretrained model training data (not owned/managed by this
+     project, used purely at inference time):
+       - The LLM (Llama 3.1, via Groq or Ollama) was pretrained/instruction-
+         tuned by Meta on large-scale general text corpora — not specific
+         to this app, used only through prompting.
+       - MusicGen (facebook/musicgen-small) was pretrained by Meta AI on a
+         licensed music dataset (~20K hours of licensed music per Meta's
+         published methodology) — again, not owned by this project, used
+         only via frozen inference.
+  2. This project's own "dataset" is the hand-curated knowledge base at
+     config/va_regions.yaml: 10 labeled points in valence/arousal space,
+     each manually annotated with a music descriptor (tempo/instruments/
+     dynamics/mood words). This is a small, structured, human-authored
+     reference table — not collected/scraped data, not used for any
+     training/fine-tuning, but functionally the "domain knowledge" artifact
+     that grounds the pipeline's music-mapping behavior. It plays the role
+     a learned regression model's parameters might play in a more
+     ML-heavy version of this system, but here it is fully transparent,
+     hand-tunable YAML instead.
+  3. Runtime-generated data, persisted locally in SQLite
+     (emotionground.db) and on disk (static/audio/): every chat's
+     messages, LLM-derived valence/arousal readings, and generated audio
+     files accumulate as the user uses the app. This is operational data,
+     not training data — it's never fed back into any model.
+
+Consequence: there is no dataset curation, cleaning, splitting,
+augmentation, or evaluation-metric pipeline in this project (no train/val/
+test split, no loss function, no fine-tuning loop) — the "ML engineering"
+surface area is entirely in (a) prompt design for the LLM stage and
+(b) inference-time orchestration of MusicGen, not in model training.
+
+
+================================================================================
+6. FULL PROCESS / WORKFLOW WALKTHROUGH (END TO END)
+================================================================================
+
+  Startup:
+    - app.py loads .env (dotenv), calls db.init_db() to create the chats/
+      messages tables if they don't exist (SQLite, CREATE TABLE IF NOT
+      EXISTS), and defensively marks any message still stuck in status
+      "generating" from a previous crashed/interrupted process run as
+      "error" (since a background thread that died mid-generation can
+      never complete and would otherwise spin the UI forever).
+    - Flask starts with debug=True but use_reloader=False (explicitly
+      disabled because Flask's file-watching auto-reloader kills and
+      restarts the whole process on code changes, which would also kill
+      any in-flight background music-generation thread).
+
+  On page load (GET /):
+    - Serves templates/index.html (a single-page app shell: sidebar of
+      past chats + a chat message view + a composer textbox).
+    - static/js/app.js fetches GET /api/chats, renders the chat list, and
+      auto-opens the most recent chat (or shows an empty state / prompt to
+      start a new chat).
+
+  On sending a message (POST /api/chats/<id>/messages):
+    1. Validates the chat exists and the text isn't empty.
+    2. Inserts a "user" role message row (status "done" immediately —
+       user messages never need generation).
+    3. Calls llm_client.get_emotion_and_reply(text) synchronously (Stage 1
+       above) — wrapped in a try/except so any unexpected exception still
+       falls back to NEUTRAL_FALLBACK rather than 500-ing the request.
+    4. Inserts an "assistant" role message row with the LLM's reply text,
+       the extracted valence/arousal, and status = "generating".
+    5. If this was the chat's first message, auto-titles the chat from a
+       truncated (42-char) version of the user's text.
+    6. Spawns a daemon background thread running run_generation(), which
+       performs Stages 2-4 (V/A -> descriptor -> prompt -> MusicGen -> WAV
+       file), then calls db.update_message(..., audio_path=..., status=
+       "done") — or status="error" on any exception, with a full traceback
+       printed server-side for debugging.
+    7. Immediately (without waiting on the thread) returns HTTP 201 with
+       both the user message and the (still-generating) assistant message.
+
+  Frontend after send:
+    - Renders both bubbles immediately (optimistic UI for the user's own
+      message, replaced by the server-confirmed row once the response
+      arrives).
+    - The assistant bubble shows an animated "Composing your track…"
+      equalizer-bars indicator (CSS animation) while status=="generating".
+    - static/js/app.js starts a 2.5-second setInterval poll of
+      GET /api/messages/<assistant_message_id>. When the polled status
+      changes away from "generating", the poll is cleared and the
+      attachment slot is replaced either with a custom audio player
+      (custom play/pause button, seekable progress track, elapsed/total
+      time label, built on the native HTMLAudioElement + Web Audio events
+      play/pause/timeupdate/loadedmetadata/ended) or an inline error
+      message ("Couldn't generate audio for this one.").
+    - The user is free to keep browsing / start other chats while a clip
+      renders in the background — generation state is per-message, tracked
+      server-side, not tied to the browser staying on that specific view.
+
+  Persistence / replay:
+    - Because the finished .wav path is stored permanently in SQLite
+      (audio_path column) and the file lives at a stable path under
+      static/audio/<chat_id>/<message_id>.wav, reopening an old chat
+      simply re-renders the stored <audio> player against the existing
+      file — the clip is never regenerated on revisit, saving compute and
+      guaranteeing the user hears the exact same clip they originally got.
+
+  Deleting a chat (DELETE /api/chats/<id>):
+    - Deletes the chat row (ON DELETE CASCADE removes its messages too),
+      then explicitly walks static/audio/<chat_id>/ and unlinks every .wav
+      file before removing the now-empty directory, so orphaned audio
+      files don't accumulate on disk.
+
+
+================================================================================
+7. DATABASE SCHEMA
+================================================================================
+
+  chats
+    id           INTEGER PRIMARY KEY AUTOINCREMENT
+    title        TEXT NOT NULL           -- auto-derived from first user message
+    created_at   TEXT NOT NULL           -- ISO-8601 UTC timestamp
+
+  messages
+    id           INTEGER PRIMARY KEY AUTOINCREMENT
+    chat_id      INTEGER NOT NULL        -- FK -> chats(id), ON DELETE CASCADE
+    role         TEXT NOT NULL           -- CHECK IN ('user', 'assistant')
+    text         TEXT NOT NULL           -- user text, or the LLM-drafted reply
+    audio_path   TEXT                    -- e.g. /static/audio/6/22.wav; NULL until generated
+    valence      REAL                    -- assistant messages only
+    arousal      REAL                    -- assistant messages only
+    status       TEXT NOT NULL DEFAULT 'done'   -- 'done' | 'generating' | 'error'
+    created_at   TEXT NOT NULL
+
+  Design notes: every DB operation opens and closes its own short-lived
+  sqlite3 connection (db.get_conn()/closing()), which is what makes this
+  layer safe to call concurrently from both Flask's request-handling
+  threads and the separate background generation thread without needing
+  a connection pool or explicit cross-thread locking at the DB layer.
+
+
+================================================================================
+8. HTTP API SURFACE
+================================================================================
+
+  GET    /api/chats                     list all chats (id, title,
+                                         created_at, preview = latest
+                                         message text), newest first
+  POST   /api/chats                     create a new empty chat ("New chat")
+  GET    /api/chats/<id>                fetch one chat + all its messages
+  DELETE /api/chats/<id>                delete a chat, its messages
+                                         (cascade), and its audio files
+  POST   /api/chats/<id>/messages       send a user message; returns the
+                                         stored user message + the newly
+                                         created assistant message
+                                         (status may be "generating")
+  GET    /api/messages/<id>             poll a single message's current
+                                         status / audio_path (used by the
+                                         frontend's 2.5s polling loop)
+
+
+================================================================================
+9. RESILIENCE / FAILURE-HANDLING DESIGN
+================================================================================
+
+  - LLM stage: 3-tier provider cascade (Groq -> Ollama -> neutral
+    hardcoded fallback) with per-provider retry (2 attempts) and strict
+    JSON-schema validation/clamping of output — guarantees the pipeline
+    always receives a usable (valence, arousal, reply) triple, and never
+    lets an LLM outage block music generation entirely (it just falls back
+    to a neutral-mood track).
+  - Music generation stage: wrapped in try/except inside the background
+    thread; any failure (model load failure, OOM, corrupt inputs, etc.)
+    is caught, logged with a full traceback server-side, and reflected to
+    the user as message status "error" with a clear "Couldn't generate
+    audio for this one." UI message, rather than leaving the UI stuck on
+    the generating indicator forever.
+  - Process-crash recovery: on every server startup, any message still
+    marked "generating" (necessarily orphaned from a previous process that
+    died mid-generation) is proactively swept to "error", since such a
+    message can never complete on its own.
+  - Concurrency control: a global generation lock serializes MusicGen
+    inference calls (CPU/GPU-bound work isn't parallelized, by design, to
+    avoid resource thrashing across simultaneous requests), while the
+    model itself is loaded exactly once and reused (lazy singleton with a
+    separate load-lock) to avoid the multi-second reload cost per request.
+  - Flask's auto-reloader is explicitly disabled (use_reloader=False)
+    specifically because it would otherwise kill in-flight background
+    generation threads on every code change during development.
+
+
+================================================================================
+10. METHODOLOGY / DESIGN RATIONALE SUMMARY
+================================================================================
+
+This project's methodology is best described as generative-model
+orchestration / composition rather than model development: it chains two
+pretrained foundation models (an LLM and a text-to-music Transformer)
+through a small, explicitly hand-designed, interpretable intermediate
+layer (the V/A-to-descriptor mapping), rather than training any new model
+end-to-end. Key methodological choices and their rationale, as documented
+directly in the codebase:
+
+  - Two-stage generation instead of one LLM call producing a music prompt
+    directly: separating "understand the emotion" (LLM, stage 1) from
+    "decide what that emotion sounds like" (deterministic V/A-region
+    lookup, stage 2) keeps the music-mapping logic auditable,
+    hand-tunable (just edit the YAML), and independent of any particular
+    LLM's stylistic quirks or hallucination risk in describing music.
+  - Grounding in an established psychological model (the circumplex model
+    of valence/arousal) rather than a bespoke or ad hoc emotion taxonomy,
+    so the 2-D interpolation between named regions is theoretically
+    motivated rather than arbitrary.
+  - Explicit graceful-degradation chains at every external-dependency
+    boundary (LLM provider cascade; neutral fallback; per-stage
+    try/except) so the app "never crashes the pipeline" even with zero
+    configured API keys and no internet access beyond the initial
+    MusicGen weight download.
+  - Preference for officially-maintained, actively-installable libraries
+    (Hugging Face transformers) over the originally-planned but
+    now-fragile facebookresearch/audiocraft package, documented as a
+    concrete environment-constraint tradeoff (Python 3.12 incompatibility)
+    rather than a quality-driven choice — output is stated to be
+    equivalent since both wrap identical pretrained weights.
+  - Background-thread + polling architecture chosen over synchronous
+    request blocking (to avoid multi-minute HTTP timeouts on CPU-bound
+    generation) and over WebSockets (kept simple — a plain interval poll
+    is sufficient for a single-user local app).
+  - No training, fine-tuning, or evaluation pipeline is present or
+    intended for this iteration — both generative models are used strictly
+    as frozen, pretrained, zero-shot inference engines, with all
+    "learning"/customization pushed into the transparent, human-editable
+    YAML descriptor layer instead of into model weights.
+
+
+================================================================================
+11. FILE-BY-FILE REFERENCE
+================================================================================
+
+  app.py                       Flask app, route handlers, background-thread
+                                dispatch for music generation, startup
+                                crash-recovery sweep.
+  db.py                        SQLite schema + all persistence functions
+                                (chats, messages CRUD).
+  llm_client.py                Stage 1: LLM emotion-extraction + reply,
+                                Groq/Ollama/neutral-fallback cascade, JSON
+                                extraction + validation.
+  music/va_mapper.py           Stage 2: nearest-2-region distance
+                                calculation + inverse-distance-weighted
+                                descriptor blending.
+  music/prompt_builder.py      Stage 3: templated, randomized natural-
+                                language MusicGen prompt construction.
+  music/generator.py           Stage 4: MusicGen model loading (lazy
+                                singleton), inference, WAV normalization
+                                and file writing.
+  config/va_regions.yaml       Hand-authored knowledge base: 10 named V/A
+                                regions with coordinates + music
+                                descriptors.
+  templates/index.html         Single-page app shell (sidebar + chat view
+                                + composer).
+  static/js/app.js             All frontend logic: API calls, chat list
+                                rendering, message rendering, custom audio
+                                player, generation-status polling,
+                                mobile sidebar toggle.
+  static/css/style.css         App styling.
+  emotionground.db             SQLite database file (created at runtime).
+  static/audio/<chat_id>/      Generated .wav clips, one per assistant
+                                message, named <message_id>.wav.
+  .env / .env.example          Provider API keys / config (GROQ_API_KEY,
+                                GROQ_MODEL, OLLAMA_BASE_URL, OLLAMA_MODEL,
+                                HF_HOME).
+  requirements.txt             Python dependencies (Flask, python-dotenv,
+                                pyyaml, groq, requests, torch, transformers,
+                                accelerate, scipy, sentencepiece).
+
+
+================================================================================
+12. HOW TO RETRAIN / FINE-TUNE MUSICGEN FOR THIS APPLICATION
+================================================================================
+
+The current app uses MusicGen entirely frozen, zero-shot, steered only by a
+templated text prompt (Section 4.4 / 4.3). That is the cheapest possible
+integration, but it has real limits: the model has no idea what "relaxed"
+or "anxious" are supposed to mean to this specific app, it only has generic
+associations learned from its original training captions, so prompt
+wording is doing all the work and output-to-intended-emotion fidelity is
+uncontrolled. Retraining (in practice, fine-tuning — training MusicGen
+from scratch is not a realistic option, see 12.1) closes that gap by
+teaching the model this app's own vocabulary and, optionally, letting it
+condition directly on the numeric valence/arousal values instead of on
+text describing them. Below is the methodology for doing that properly.
+
+
+--------------------------------------------------------------------------
+12.1  FINE-TUNE, DON'T TRAIN FROM SCRATCH
+--------------------------------------------------------------------------
+
+MusicGen-small is a ~300M-parameter model pretrained on Meta's internal
+~20,000-hour licensed music corpus. Reproducing that from scratch would
+require: a music dataset of comparable scale and licensing clearance, an
+already-trained EnCodec audio tokenizer (or training one, which itself
+needs a large diverse audio corpus), and enough GPU-hours (multi-GPU,
+days-to-weeks) to be well outside the scope of a project like this. The
+correct approach is transfer learning: start from the public pretrained
+`facebook/musicgen-small` checkpoint and fine-tune only on a small,
+purpose-built dataset that teaches it this app's specific
+emotion-to-music associations. This is standard practice for adapting
+MusicGen to a domain/style — it is explicitly supported by both Meta's
+own `audiocraft` training code and by Hugging Face `transformers`.
+
+
+--------------------------------------------------------------------------
+12.2  CHOOSE WHAT YOU ARE ACTUALLY CONDITIONING ON
+--------------------------------------------------------------------------
+
+Two different fine-tuning targets are possible, and they imply different
+data and different amounts of engineering work:
+
+  Option A — Fine-tune on richer/consistent TEXT captions (keeps the
+  current text-conditioning architecture unchanged):
+    Train the model to associate the app's own descriptor vocabulary
+    (its tempo ranges, instrument lists, dynamics words, mood words from
+    config/va_regions.yaml, and the exact phrasing prompt_builder.py
+    produces) with audio that a human agrees actually sounds like that
+    description. This is the lower-effort, lower-risk option: no
+    architecture changes, just a fine-tuning run on (caption, audio)
+    pairs using the model's existing text-conditioning pathway. It
+    improves prompt adherence and consistency for this app's specific
+    prompt style without touching model internals.
+
+  Option B — Add direct CONTINUOUS (valence, arousal) conditioning
+  (bypasses prompt_builder.py, architecturally deeper):
+    Instead of translating (valence, arousal) into words and hoping the
+    text encoder captures the intended emotional target, feed the two
+    floats directly into the model as a conditioning signal — e.g. via a
+    small learned embedding/MLP projecting (valence, arousal) into the
+    same conditioning space MusicGen's cross-attention already uses for
+    text (a FiLM-style or additional cross-attention conditioning
+    module, added alongside the existing T5 text conditioning or
+    replacing it for this task). This is closer to how MusicGen's own
+    optional melody-conditioning is implemented (an added conditioning
+    stream, not a prompt-string hack) and it is more theoretically
+    correct — it removes the language bottleneck of the current
+    2-stage-text pipeline (Stage 1 outputs numbers -> Stage 3 turns them
+    back into words -> Stage 4's text encoder turns them back into
+    numbers again). It requires modifying/extending the model's
+    conditioning modules, which means working inside `audiocraft`'s or
+    `transformers`' model code rather than only its data pipeline, and
+    is a meaningfully bigger engineering lift.
+
+  Recommendation for this project's scope: start with Option A. It
+  directly improves the existing pipeline with a contained, well-scoped
+  fine-tuning job. Treat Option B as a stretch goal / "future work" item
+  once Option A's data pipeline and training loop are working end-to-end.
+
+
+--------------------------------------------------------------------------
+12.3  BUILDING A TRAINING DATASET (THE HARD PART)
+--------------------------------------------------------------------------
+
+Fine-tuning MusicGen requires (audio clip, text caption) pairs — this is
+the piece the current app has none of (Section 5 explains why). To build
+one:
+
+  1. Source labeled or label-able music-emotion audio. Realistic options,
+     roughly in order of how directly usable they are:
+       - Public music-emotion datasets with valence/arousal-style
+         annotations, e.g. DEAM (MediaEval "Database for Emotional
+         Analysis in Music"), PMEmo, EMOPIA (piano performances labeled
+         with the 4 valence/arousal quadrants), AMG1608. These already
+         give you (audio, valence, arousal) tuples, which is exactly this
+         app's native representation — check each dataset's license
+         before any redistribution or commercial use.
+       - The MTG-Jamendo dataset's mood/theme subset (Creative-Commons
+         licensed audio with mood tags) — tags can be mapped onto the
+         app's 10 named regions by hand or via a lookup table.
+       - Your own commissioned/royalty-free/CC-licensed audio, manually
+         or algorithmically tagged.
+     Avoid scraping copyrighted commercial music without a license — that
+     is both a legal risk and specifically the reason Meta's own MusicGen
+     training data had to be a licensed corpus rather than open-scraped
+     audio.
+  2. Convert each clip's label into this app's caption format. Whatever
+     the source annotation looks like (raw V/A floats, mood tags,
+     genre/mood metadata), run it through the SAME two functions the app
+     already uses at inference time — music.va_mapper.map_va_to_descriptor()
+     and music.prompt_builder.build_prompt() — so every training caption
+     is drawn from literally the same template/vocabulary distribution the
+     model will be prompted with in production. This alignment between
+     training-caption style and inference-prompt style is the single
+     biggest lever for making fine-tuning actually pay off.
+  3. Standardize audio: resample every clip to MusicGen's expected sample
+     rate (32kHz for musicgen-small), convert to mono, trim/pad to a
+     fixed duration matching the app's use case (30s, matching
+     CLIP_DURATION_SECONDS in app.py), and normalize loudness so the
+     model doesn't learn to associate emotion with recording volume.
+  4. Split into train/validation/(test) sets, holding out enough examples
+     per emotion region to check the model hasn't just memorized the
+     training clips. Given a small dataset (tens to low hundreds of
+     hours is typical for this kind of fine-tune, far less than the
+     original 20K-hour pretraining), watch specifically for
+     over-representation of any one V/A region skewing generation
+     toward that region regardless of prompt.
+
+
+--------------------------------------------------------------------------
+12.4  TRAINING PIPELINE / TOOLING
+--------------------------------------------------------------------------
+
+Two practical routes, matching the two ways this app already documents
+running MusicGen at all (see README's note in Section 4.4):
+
+  Route 1 — Meta's `audiocraft` repo (the original, training-first
+  codebase):
+    - `audiocraft` ships purpose-built training recipes/configs for
+      MusicGen fine-tuning (solver classes, dataset manifest format,
+      Hydra-based config system) and is the most battle-tested path for
+      this exact task, since it's what MusicGen was originally trained
+      with.
+    - As already noted in this app's README, `audiocraft` hard-pins
+      `torch==2.1.0`, which has no wheels for Python 3.12 (this app's
+      current environment). Fine-tuning would therefore need a separate
+      training environment — e.g. Python 3.10/3.11 with `torch==2.1.0`
+      and a CUDA-capable GPU — kept isolated from the app's own
+      inference environment (which stays on modern torch/Python via
+      `transformers` as documented in Section 4.4). The resulting
+      fine-tuned checkpoint is then loaded back into the app's
+      `transformers`-based `music/generator.py` for inference (Hugging
+      Face's MusicGen implementation is checkpoint-compatible with
+      audiocraft-trained weights, since it's a reimplementation of the
+      same architecture).
+
+  Route 2 — Hugging Face `transformers` fine-tuning (matches the app's
+  existing inference stack exactly, no second environment needed):
+    - `transformers`' `MusicgenForConditionalGeneration` supports a
+      standard forward/loss pass suitable for a custom PyTorch training
+      loop or `Trainer`/`Seq2SeqTrainer`: feed the text captions through
+      the model's processor exactly as `music/generator.py` already does
+      at inference, feed the corresponding audio through the model's
+      EnCodec-based audio encoder to obtain target discrete codebook
+      tokens, and train with teacher forcing (predict next codebook
+      tokens given the text conditioning + previous tokens), same
+      objective as ordinary autoregressive language-model training but
+      over audio tokens instead of text tokens.
+    - Loss: cross-entropy over each codebook's token vocabulary, applied
+      per-timestep, respecting MusicGen's inter-codebook delay pattern
+      (Section 4.4) so the loss aligns predictions with the correct
+      offset codebook.
+    - This route stays inside the same library/Python version the app
+      already runs on, which is the more maintainable choice for this
+      project specifically.
+
+  Parameter-efficient option (recommended given a small dataset and
+  likely single-consumer-GPU or rented-GPU budget): rather than
+  full-fine-tuning all ~300M parameters (higher overfitting risk on a
+  small dataset, more VRAM), apply LoRA (Low-Rank Adaptation) adapters to
+  the decoder Transformer's attention projection layers via Hugging
+  Face's `peft` library, and freeze the text encoder and the EnCodec
+  audio codec entirely (they don't need to change — only the
+  conditioning-to-music mapping does). This drastically cuts trainable
+  parameter count and VRAM footprint, and is the standard modern approach
+  for adapting a pretrained generative audio model to a narrow domain
+  without catastrophic forgetting of its general music-generation
+  ability.
+
+  Representative (not prescriptive) hyperparameters for a LoRA fine-tune
+  of this scale: learning rate ~1e-4 to 5e-4 on the LoRA adapters, LoRA
+  rank 8-16, batch size limited by VRAM (audio sequences are long — even
+  30s at 50 Hz is 1500 tokens per codebook), a few epochs over the
+  dataset with early stopping on validation loss, mixed-precision
+  (fp16/bf16) training, gradient accumulation if batch size must be kept
+  small.
+
+  Hardware note: unlike the current app (explicitly CPU-friendly per its
+  README), training/fine-tuning realistically requires a CUDA GPU with
+  enough VRAM to hold the model, optimizer states, and audio-token
+  activations — a single modern consumer GPU (e.g. 16-24GB VRAM) is
+  plausible for a LoRA fine-tune of musicgen-small; full fine-tuning or
+  musicgen-medium/large would need substantially more.
+
+
+--------------------------------------------------------------------------
+12.5  EVALUATION METHODOLOGY
+--------------------------------------------------------------------------
+
+Retraining is only worth shipping if it's measurably better than the
+current zero-shot pipeline, so evaluation needs to be planned before
+training, not after:
+
+  - Objective audio-quality metrics: Fréchet Audio Distance (FAD)
+    between generated clips and a held-out set of real reference clips
+    per emotion region — standard for judging whether generative audio
+    models have degraded or improved in raw audio fidelity/diversity
+    relative to a baseline (the current frozen model) after fine-tuning.
+  - Text-audio / prompt-adherence metrics: a CLAP (Contrastive
+    Language-Audio Pretraining) similarity score between the input
+    caption and the generated audio, to check the fine-tuned model
+    follows this app's specific prompt style at least as well as (ideally
+    better than) the frozen baseline.
+  - Closed-loop emotion-consistency check (most directly relevant to
+    this app's actual goal): train or reuse an existing music-emotion-
+    recognition (MER) model that predicts valence/arousal from raw audio,
+    run it on this pipeline's generated clips, and compare the predicted
+    V/A back against the V/A the clip was supposed to represent. This
+    directly measures whether fine-tuning actually improved "does the
+    generated clip sound like the mood it was supposed to," which none
+    of the generic audio-quality metrics above can tell you on their own.
+  - Human listening evaluation: A/B preference tests (fine-tuned vs.
+    frozen baseline, same prompt) and/or mood-matching tests (blind
+    listeners guess which of the 10 named regions a clip was generated
+    for) — given the app's whole premise is subjective emotional
+    resonance, human judgment is the ground truth objective metrics are
+    only proxies for.
+  - Regression check against the current baseline: since the frozen
+    `facebook/musicgen-small` already produces plausible general music,
+    explicitly verify the fine-tuned model hasn't lost general audio
+    quality/diversity outside the app's 10 regions (catastrophic
+    forgetting) — hold out a few generic, non-mood-specific prompts and
+    listen for degradation.
+
+
+--------------------------------------------------------------------------
+12.6  INTEGRATING A FINE-TUNED CHECKPOINT BACK INTO THE APP
+--------------------------------------------------------------------------
+
+Once a fine-tuned checkpoint passes evaluation, integration into the
+existing codebase is a small, contained change:
+
+  - In `music/generator.py`, change `MODEL_ID = "facebook/musicgen-small"`
+    to point at the fine-tuned checkpoint (a local directory path, or a
+    private Hugging Face Hub repo id if pushed there) — `_ensure_loaded()`
+    already calls `AutoProcessor.from_pretrained(MODEL_ID)` and
+    `MusicgenForConditionalGeneration.from_pretrained(MODEL_ID)` generically,
+    so no other code in that file needs to change for Option A
+    (text-conditioning fine-tune).
+  - If a LoRA adapter was used rather than a full fine-tune, load the
+    base model then apply/merge the adapter weights (via `peft`) during
+    `_ensure_loaded()` before calling `.eval()`.
+  - If pursuing Option B (direct V/A conditioning), `app.py`'s
+    `run_generation()` and `music/generator.py`'s `generate_music()`
+    signatures would need to change to pass `valence`/`arousal` straight
+    through instead of (or alongside) the text `prompt`, and
+    `music/prompt_builder.py` would become optional/legacy rather than
+    load-bearing.
+  - Keep the original frozen `facebook/musicgen-small` path available as
+    a documented fallback/comparison baseline (e.g. via an environment
+    variable) so the fine-tuned model can be A/B-toggled without a code
+    change, and so a regression in the fine-tuned model doesn't strand
+    the app with no working generator.
+  - Version fine-tuned checkpoints explicitly (e.g. directory names or
+    Hub tags including a date/dataset version) since, unlike the current
+    setup where `MODEL_ID` always resolves to the same public frozen
+    weights, a fine-tuned model is now a mutable project artifact that
+    needs its own change history.
+
+
+--------------------------------------------------------------------------
+12.7  RISKS AND CAVEATS
+--------------------------------------------------------------------------
+
+  - Small-dataset overfitting: fine-tuning a 300M-parameter model on a
+    dataset several orders of magnitude smaller than its original
+    pretraining corpus risks memorizing specific training clips rather
+    than generalizing the mood-to-music mapping — mitigate via LoRA
+    (fewer trainable parameters), strong regularization/early stopping,
+    and a validation split that's actually held out.
+  - Data licensing: music-emotion datasets and any additional audio
+    sourced for this purpose must be checked for licenses that permit
+    training use (and redistribution of the fine-tuned model, if that's
+    ever shared) — this was explicitly the reason Meta trained the
+    original model on a licensed corpus rather than scraped audio.
+  - Label noise / subjectivity of ground truth: valence/arousal labels
+    for music are inherently subjective (different annotators can
+    disagree on the same clip) — expect some irreducible noise ceiling
+    in both the training labels and any closed-loop MER-based evaluation
+    metric, and don't over-interpret small metric deltas as meaningful.
+  - Compute/cost: this is the one part of the project that meaningfully
+    changes the app's "runs locally on a laptop CPU" positioning
+    (Section 3 / README) — training needs a GPU (local or rented cloud),
+    unlike every other component of the current app, which is explicitly
+    designed to work with zero GPU and zero training infrastructure.
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================
