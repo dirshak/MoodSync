@@ -15,7 +15,9 @@ from music.prompt_builder import build_prompt
 
 BASE_DIR = Path(__file__).resolve().parent
 AUDIO_DIR = BASE_DIR / "static" / "audio"
-CLIP_DURATION_SECONDS = 30
+# Overridable so CPU-only deployments (e.g. a free HF Space) can render
+# shorter clips; the local default stays 30s.
+CLIP_DURATION_SECONDS = float(os.environ.get("CLIP_DURATION_SECONDS", 30))
 
 app = Flask(__name__)
 db.init_db()

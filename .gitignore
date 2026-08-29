@@ -5,3 +5,6 @@ static/audio/
 __pycache__/
 *.pyc
 .hf_cache/
+Research paper/research.txt.bak
+eval/clips/
+eval/results.json

@@ -18,3 +18,7 @@ transformers>=4.40
 accelerate>=0.30
 scipy>=1.11
 sentencepiece>=0.2
+
+# Front-end for the hosted Hugging Face Space (app_gradio.py).
+# The local Flask app (app.py) does not require this.
+gradio>=5.0

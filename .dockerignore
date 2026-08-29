@@ -1,0 +1,10 @@
+.venv/
+.git/
+__pycache__/
+*.pyc
+static/audio/
+emotionground.db
+eval/clips/
+Research paper/
+MoodSync_Detailed_Summary.txt
+.env
