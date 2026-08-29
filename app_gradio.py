@@ -76,14 +76,24 @@ except ImportError:  # local / non-Spaces environment
         return lambda fn: fn                    # @_gpu(duration=...)
 
 
-@_gpu(duration=180)
-def generate_clip(prompt: str, duration: float, out_path: str) -> str:
-    """The only GPU-bound step. Imported lazily so module import stays light;
-    on ZeroGPU, CUDA is only available inside this decorated call, which is
-    also where music.generator picks its device."""
-    from music.generator import generate_music
+# Pay the ~1.5GB download and model load once at startup, on CPU. Doing it
+# inside the GPU call instead would blow the ZeroGPU time limit on first use.
+if os.environ.get("SPACE_ID"):
+    from music.generator import preload as _preload
 
-    generate_music(prompt, duration, out_path)
+    _preload()
+
+
+@_gpu(duration=60)
+def generate_clip(prompt: str, duration: float, out_path: str) -> str:
+    """The only GPU-bound step. ZeroGPU grants CUDA only inside this call, so
+    the model -- loaded on CPU at startup -- is moved here on first use."""
+    import torch
+
+    from music import generator as G
+
+    G.move_to("cuda" if torch.cuda.is_available() else "cpu")
+    G.generate_music(prompt, duration, out_path)
     return out_path
 
 

@@ -44,6 +44,26 @@ def is_loaded() -> bool:
     return _model is not None
 
 
+def preload() -> None:
+    """Download and load the model without generating anything.
+
+    Used by the ZeroGPU deployment to pay the one-off ~1.5GB download and
+    model load at startup rather than inside a time-limited GPU window."""
+    _ensure_loaded()
+
+
+def move_to(device: str) -> None:
+    """Move the loaded model onto `device`.
+
+    On ZeroGPU, CUDA only becomes available inside an @spaces.GPU call, so the
+    device chosen at load time (CPU) has to be revised once we are inside one."""
+    global _device
+    _ensure_loaded()
+    if _device != device:
+        _model.to(device)
+        _device = device
+
+
 def generate_music(prompt: str, duration_seconds: float, out_path: Path) -> None:
     """Generates `duration_seconds` of audio from `prompt` and writes a wav
     file to `out_path`, creating parent directories as needed."""
