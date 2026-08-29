@@ -132,9 +132,9 @@ with gr.Blocks(title="MoodSync", theme=gr.themes.Soft()) as demo:
     clear.click(lambda: ([], None, ""), None, [chat, audio, status])
 
 if __name__ == "__main__":
-    # show_api=False: building the /info schema crashes inside gradio_client
-    # ("argument of type 'bool' is not iterable") because a component schema
-    # carries a boolean additionalProperties. HF probes /info at startup, so
-    # the repeated ASGI error takes the Space down. We expose no programmatic
-    # API, so disabling the endpoint costs nothing.
-    demo.queue(max_size=8).launch(show_api=False)
+    # ssr_mode=False: Gradio 5 serves an experimental SSR frontend through a
+    # Node proxy. On this Space that proxy exits at startup ("Stopping
+    # Node.js server..."), taking the process with it. Serving the Python
+    # app directly is stable. show_api is left at its default now that the
+    # /info schema builds correctly on Gradio 5.50.
+    demo.queue(max_size=8).launch(ssr_mode=False)
