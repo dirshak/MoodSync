@@ -285,7 +285,7 @@ The zero-shot pipeline described in Section~3 steers \musicgen{} purely through 
 
 \subsection{Fine-Tuning Method and Hyperparameters}
 
-The base \texttt{facebook/musicgen-small} checkpoint (approximately 300M parameters) is kept frozen, and Low-Rank Adaptation~\cite{hu2022lora} is applied to the attention projection layers of \musicgen{}'s T5-based text encoder~\cite{raffel2020t5} via Hugging Face's \texttt{peft} library~\cite{mangrulkar2022peft}, following the same parameter-efficient, text-encoder-targeted pattern used in the closest published methodological precedent for LoRA-adapted MusicGen fine-tuning~\cite{lee2026loramusicgen}. The decoder transformer and the EnCodec tokenizer are left entirely frozen. Table~\ref{tab:hyperparams} summarizes the configuration used.
+In the proposed configuration the base \texttt{facebook/musicgen-small} checkpoint (approximately 300M parameters) would be kept frozen, and Low-Rank Adaptation~\cite{hu2022lora} applied to the attention projection layers of \musicgen{}'s T5-based text encoder~\cite{raffel2020t5} via Hugging Face's \texttt{peft} library~\cite{mangrulkar2022peft}, following the same parameter-efficient, text-encoder-targeted pattern used in the closest published methodological precedent for LoRA-adapted MusicGen fine-tuning~\cite{lee2026loramusicgen}. The decoder transformer and the EnCodec tokenizer would be left entirely frozen. Table~\ref{tab:hyperparams} summarizes the proposed configuration.
 
 \begin{table}[t]
 \centering
@@ -312,7 +312,7 @@ Because the fine-tuning stage touches only part of the overall MoodSync pipeline
 
 \begin{table}[t]
 \centering
-\caption{Frozen vs.\ trainable status of every component in the pipeline. Only the LoRA adapter matrices are updated by gradient descent; every other component is either a frozen pretrained network or a non-learned, hand-authored rule.}
+\caption{Frozen vs.\ trainable status of every component in the pipeline. Only the LoRA adapter matrices would be updated by gradient descent; every other component is either a frozen pretrained network or a non-learned, hand-authored rule. No checkpoint was trained for this paper.}
 \label{tab:frozen}
 \small
 \begin{tabular}{@{}p{4.6cm}p{2.1cm}p{6.3cm}@{}}
