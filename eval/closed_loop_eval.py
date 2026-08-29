@@ -51,10 +51,21 @@ def load_clap():
     return model, proc
 
 
+def _as_tensor(out):
+    """transformers>=5 returns a ModelOutput here rather than a bare tensor."""
+    if isinstance(out, torch.Tensor):
+        return out
+    for attr in ("text_embeds", "audio_embeds", "pooler_output"):
+        v = getattr(out, attr, None)
+        if v is not None:
+            return v
+    return out.last_hidden_state.mean(dim=1)
+
+
 def embed_text(model, proc, texts):
     inp = proc(text=texts, return_tensors="pt", padding=True)
     with torch.no_grad():
-        e = model.get_text_features(**inp)
+        e = _as_tensor(model.get_text_features(**inp))
     return torch.nn.functional.normalize(e, dim=-1)
 
 
@@ -67,9 +78,9 @@ def embed_audio(model, proc, wav_path):
         from math import gcd
         g = gcd(int(sr), CLAP_SR)
         audio = resample_poly(audio, CLAP_SR // g, int(sr) // g)
-    inp = proc(audios=[audio], sampling_rate=CLAP_SR, return_tensors="pt")
+    inp = proc(audio=[audio], sampling_rate=CLAP_SR, return_tensors="pt")
     with torch.no_grad():
-        e = model.get_audio_features(**inp)
+        e = _as_tensor(model.get_audio_features(**inp))
     return torch.nn.functional.normalize(e, dim=-1)
 
 

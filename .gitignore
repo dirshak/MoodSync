@@ -7,4 +7,3 @@ __pycache__/
 .hf_cache/
 Research paper/research.txt.bak
 eval/clips/
-eval/results.json
