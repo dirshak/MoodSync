@@ -100,8 +100,8 @@ with gr.Blocks(title="MoodSync") as demo:
     clear.click(lambda: ([], None, ""), None, [chat, audio, status])
 
 if __name__ == "__main__":
-    # No server_name/server_port override: Gradio 6 runs an SSR frontend that
-    # owns the public port and proxies to Python behind it, so pinning the
-    # Python server to 7860 collides with the proxy and kills the process.
-    # On HF Spaces the defaults are already correct.
-    demo.queue(max_size=8).launch()
+    # ssr_mode=False: Gradio 6 defaults to an SSR frontend backed by a Node
+    # proxy. On this Space that proxy exits immediately at startup
+    # ("Stopping Node.js server..."), taking the whole process with it,
+    # with or without an explicit port. Serving Python directly is stable.
+    demo.queue(max_size=8).launch(ssr_mode=False)
