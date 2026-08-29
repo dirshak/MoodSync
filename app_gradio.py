@@ -55,10 +55,36 @@ from llm_client import get_emotion_and_reply, NEUTRAL_FALLBACK
 from music.va_mapper import map_va_to_descriptor
 from music.prompt_builder import build_prompt
 
-# Free Space CPU is ~2 vCPU, so default to a shorter clip than the local app.
-CLIP_DURATION_SECONDS = float(os.environ.get("CLIP_DURATION_SECONDS", 10))
+# ZeroGPU renders a 30s clip in seconds, so match the local app and the paper.
+CLIP_DURATION_SECONDS = float(os.environ.get("CLIP_DURATION_SECONDS", 30))
 AUDIO_DIR = Path(tempfile.gettempdir()) / "moodsync_audio"
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ZeroGPU: HF errors the Space at startup unless at least one function is
+# decorated with @spaces.GPU. The `spaces` package only exists on Spaces
+# hardware, so fall back to a no-op decorator for local runs.
+try:
+    import spaces
+
+    _gpu = spaces.GPU
+except ImportError:  # local / non-Spaces environment
+
+    def _gpu(*args, **kwargs):
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]                      # bare @_gpu
+        return lambda fn: fn                    # @_gpu(duration=...)
+
+
+@_gpu(duration=180)
+def generate_clip(prompt: str, duration: float, out_path: str) -> str:
+    """The only GPU-bound step. Imported lazily so module import stays light;
+    on ZeroGPU, CUDA is only available inside this decorated call, which is
+    also where music.generator picks its device."""
+    from music.generator import generate_music
+
+    generate_music(prompt, duration, out_path)
+    return out_path
 
 
 def respond(message, history):
@@ -83,17 +109,15 @@ def respond(message, history):
 
     region = f"{descriptor['primary_region']}/{descriptor['secondary_region']}"
     status = (f"valence {valence:+.2f} · arousal {arousal:+.2f} · region {region}\n\n"
-              f"Prompt: {prompt}\n\nGenerating {CLIP_DURATION_SECONDS:.0f}s of audio "
-              f"(a few minutes on free CPU)…")
+              f"Prompt: {prompt}\n\nGenerating {CLIP_DURATION_SECONDS:.0f}s of audio…")
     history = history + [{"role": "assistant", "content": reply}]
     yield history, None, status
 
     try:
-        from music.generator import generate_music
         out = AUDIO_DIR / f"clip_{abs(hash((message, prompt)))}.wav"
-        generate_music(prompt, CLIP_DURATION_SECONDS, out)
+        generate_clip(prompt, CLIP_DURATION_SECONDS, str(out))
         yield history, str(out), status.replace("Generating", "Generated").replace(
-            "(a few minutes on free CPU)…", "— done.")
+            "s of audio…", "s of audio — done.")
     except Exception:
         traceback.print_exc()
         yield history, None, status + "\n\nGeneration failed; see logs."
@@ -106,7 +130,7 @@ with gr.Blocks(title="MoodSync", theme=gr.themes.Soft()) as demo:
         "**valence/arousal** coordinate (Russell's Circumplex Model), that point is "
         "mapped onto a bank of ten hand-authored emotion regions, and the resulting "
         "descriptor prompts **MusicGen** to render an original instrumental clip.\n\n"
-        "*Free CPU hardware — generation takes a few minutes per clip.*"
+        "*Runs on ZeroGPU; the first request also downloads the model, so it is slower.*"
     )
     # Gradio 5 defaults to the legacy tuples format; respond() yields dicts.
     chat = gr.Chatbot(type="messages", height=340, label="Chat")

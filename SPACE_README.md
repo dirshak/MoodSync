@@ -15,8 +15,8 @@ Describe how you're feeling; an LLM reads your message into a valence/arousal
 coordinate, that coordinate is mapped onto ten hand-authored emotion regions,
 and the resulting descriptor prompts MusicGen to render an instrumental clip.
 
-**Speed:** free CPU hardware, so generation takes a few minutes per clip.
-`CLIP_DURATION_SECONDS` defaults to 10 here; the local Flask app uses 30.
+**Speed:** runs on ZeroGPU, so a 30-second clip renders in seconds. The first
+request after a restart also downloads the model (~1.5GB) and is slower.
 
 **Persistence:** clips are written to a temp directory and are not retained
 across restarts. The local Flask app persists chats in SQLite.
