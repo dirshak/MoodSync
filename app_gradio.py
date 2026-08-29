@@ -16,6 +16,37 @@ import traceback
 from pathlib import Path
 
 import gradio as gr
+
+# --- gradio_client schema shim -------------------------------------------
+# gradio_client's JSON-schema walker assumes every schema node is a dict, but
+# JSON Schema allows `additionalProperties: true` (a bare boolean). Gradio's
+# own Chatbot schema contains one, so building the /info endpoint raises
+#   TypeError: argument of type 'bool' is not iterable
+# at gradio_client/utils.py:get_type. HF Spaces probes /info at startup, so the
+# repeated ASGI error takes the Space down. show_api=False does not help --
+# the route stays registered. Teach both helpers to treat a boolean node as
+# "anything", which is what `true` means in JSON Schema.
+import gradio_client.utils as _gcu
+
+_orig_get_type = _gcu.get_type
+_orig_to_python_type = _gcu._json_schema_to_python_type
+
+
+def _get_type(schema):
+    if not isinstance(schema, dict):
+        return "Any"
+    return _orig_get_type(schema)
+
+
+def _json_schema_to_python_type(schema, defs=None):
+    if isinstance(schema, bool):
+        return "Any"
+    return _orig_to_python_type(schema, defs)
+
+
+_gcu.get_type = _get_type
+_gcu._json_schema_to_python_type = _json_schema_to_python_type
+# -------------------------------------------------------------------------
 from dotenv import load_dotenv
 
 load_dotenv()
