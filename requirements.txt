@@ -21,4 +21,4 @@ sentencepiece>=0.2
 
 # Front-end for the hosted Hugging Face Space (app_gradio.py).
 # The local Flask app (app.py) does not require this.
-gradio>=6.0
+gradio>=5.0,<6

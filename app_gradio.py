@@ -68,7 +68,7 @@ def respond(message, history):
         yield history, None, status + "\n\nGeneration failed; see logs."
 
 
-with gr.Blocks(title="MoodSync") as demo:
+with gr.Blocks(title="MoodSync", theme=gr.themes.Soft()) as demo:
     gr.Markdown(
         "# 🎵 MoodSync\n"
         "Describe how you're feeling. An LLM reads your message into a "
@@ -77,7 +77,8 @@ with gr.Blocks(title="MoodSync") as demo:
         "descriptor prompts **MusicGen** to render an original instrumental clip.\n\n"
         "*Free CPU hardware — generation takes a few minutes per clip.*"
     )
-    chat = gr.Chatbot(height=340, label="Chat")
+    # Gradio 5 defaults to the legacy tuples format; respond() yields dicts.
+    chat = gr.Chatbot(type="messages", height=340, label="Chat")
     status = gr.Markdown("")
     audio = gr.Audio(label="Generated clip", type="filepath", interactive=False)
     box = gr.Textbox(placeholder="e.g. I've had a long, draining day…",
@@ -100,8 +101,4 @@ with gr.Blocks(title="MoodSync") as demo:
     clear.click(lambda: ([], None, ""), None, [chat, audio, status])
 
 if __name__ == "__main__":
-    # ssr_mode=False: Gradio 6 defaults to an SSR frontend backed by a Node
-    # proxy. On this Space that proxy exits immediately at startup
-    # ("Stopping Node.js server..."), taking the whole process with it,
-    # with or without an explicit port. Serving Python directly is stable.
-    demo.queue(max_size=8).launch(ssr_mode=False)
+    demo.queue(max_size=8).launch()
