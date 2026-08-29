@@ -69,6 +69,10 @@ def generate_music(prompt: str, duration_seconds: float, out_path: Path) -> None
     file to `out_path`, creating parent directories as needed."""
     from scipy.io import wavfile
 
+    # Accept str as well as Path: the ZeroGPU worker boundary passes plain
+    # strings, and callers outside this module shouldn't have to care.
+    out_path = Path(out_path)
+
     _ensure_loaded()
 
     with _generate_lock:
