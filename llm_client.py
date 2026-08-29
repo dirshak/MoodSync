@@ -75,7 +75,7 @@ def _call_groq(user_text: str) -> dict | None:
         from groq import Groq
 
         client = Groq(api_key=api_key)
-        model = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+        model = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
         for _attempt in range(2):
             resp = client.chat.completions.create(
                 model=model,
