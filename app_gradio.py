@@ -100,6 +100,7 @@ with gr.Blocks(title="MoodSync") as demo:
     clear.click(lambda: ([], None, ""), None, [chat, audio, status])
 
 if __name__ == "__main__":
-    demo.queue(max_size=8).launch(server_name="0.0.0.0",
-                                  server_port=int(os.environ.get("PORT", 7860)),
-                                  theme=gr.themes.Soft())
+    # ssr_mode=False: Gradio 6 defaults to SSR, which spawns a Node proxy
+    # alongside the Python server. On HF Spaces that proxy exiting takes the
+    # whole process down ("Stopping Node.js server..."), so serve directly.
+    demo.queue(max_size=8).launch(ssr_mode=False, theme=gr.themes.Soft())
