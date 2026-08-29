@@ -68,7 +68,7 @@ def respond(message, history):
         yield history, None, status + "\n\nGeneration failed; see logs."
 
 
-with gr.Blocks(title="MoodSync", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="MoodSync") as demo:
     gr.Markdown(
         "# 🎵 MoodSync\n"
         "Describe how you're feeling. An LLM reads your message into a "
@@ -77,7 +77,7 @@ with gr.Blocks(title="MoodSync", theme=gr.themes.Soft()) as demo:
         "descriptor prompts **MusicGen** to render an original instrumental clip.\n\n"
         "*Free CPU hardware — generation takes a few minutes per clip.*"
     )
-    chat = gr.Chatbot(type="messages", height=340, label="Chat")
+    chat = gr.Chatbot(height=340, label="Chat")
     status = gr.Markdown("")
     audio = gr.Audio(label="Generated clip", type="filepath", interactive=False)
     box = gr.Textbox(placeholder="e.g. I've had a long, draining day…",
@@ -101,4 +101,5 @@ with gr.Blocks(title="MoodSync", theme=gr.themes.Soft()) as demo:
 
 if __name__ == "__main__":
     demo.queue(max_size=8).launch(server_name="0.0.0.0",
-                                  server_port=int(os.environ.get("PORT", 7860)))
+                                  server_port=int(os.environ.get("PORT", 7860)),
+                                  theme=gr.themes.Soft())
